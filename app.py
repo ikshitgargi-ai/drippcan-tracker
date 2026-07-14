@@ -9914,6 +9914,7 @@ def api_listings_ledger():
 
 
 @app.route('/api/listings/source-health', methods=['GET'])
+@require_app_origin
 def api_listings_source_health():
     """Per-source freshness of the ledger — last observed_date, last write, and
     rows in the last 7 days — so a stale or LOST source (SOD or live gone dark)
@@ -13185,6 +13186,7 @@ def api_cron_morning_digest():
 # (frontend renders a green/amber/red dot using these signals).
 # ───────────────────────────────────────────────────────────────────────
 @app.route('/api/admin/system-status', methods=['GET'])
+@require_app_origin
 def api_admin_system_status():
     """Aggregate health signals into one tier: ok | degraded | down.
 
@@ -13348,6 +13350,7 @@ def api_admin_db_stats():
 
 
 @app.route('/api/admin/integrity', methods=['GET'])
+@require_admin_token
 def api_admin_integrity():
     """One-call "is the data sound?" check for the canonical listing ledger.
 
@@ -22161,6 +22164,7 @@ def run_live_batch(triggered_by='scheduler'):
                         cur.execute("ROLLBACK TO SAVEPOINT sp_ledger_live")
                     except Exception:
                         pass
+                errors.append(f"ledger fold skipped for {sku}: {_le}")
                 print(f"[LIVE] listing_ledger fold skipped for {sku} (non-fatal): {_le}")
 
         status = 'ok' if not errors else ('error' if not per_sku_rows else 'partial')

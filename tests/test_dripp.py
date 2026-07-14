@@ -297,6 +297,27 @@ class TestLiveEngine:
         # Unchanged store never generates noise
         assert ('LIVE_RESTOCK', 1) not in events
 
+    def test_live_batches_fold_into_listing_ledger(self, app_module):
+        # The canonical ledger must capture the live signal from the two
+        # batches above: LISTED for the newly seen store, DELISTED for the one
+        # that vanished, RECONFIRMED (deduped per day) for every store seen.
+        db = _db()
+        rows = {
+            (r['event'], r['store_number'])
+            for r in db.execute(
+                "SELECT event, store_number FROM listing_ledger "
+                "WHERE sku=? AND source='live'", (PHOENIX,)).fetchall()
+        }
+        total_live = db.execute(
+            "SELECT COUNT(*) FROM listing_ledger WHERE source='live'").fetchone()[0]
+        db.close()
+        assert ('LISTED', 4) in rows          # LIVE_NEW_LISTING folded
+        assert ('DELISTED', 3) in rows        # LIVE_DELISTED folded
+        assert ('RECONFIRMED', 1) in rows and ('RECONFIRMED', 2) in rows
+        # Phoenix 5 (RECONFIRMED 1/2/3 + LISTED 4 + DELISTED 3) + Dayaa 1;
+        # batch 2 re-sightings dedupe to no-ops (one row per source per day).
+        assert total_live == 6
+
     def test_live_latest_returns_only_newest_batch(self, client):
         body = client.get(f'/api/live/latest?sku={PHOENIX}&nocache=1').get_json()
         sku_block = body['skus'][PHOENIX]
