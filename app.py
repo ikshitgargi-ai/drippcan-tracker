@@ -105,10 +105,15 @@ def _cache_invalidate(*view_names):
             _cache_store.pop(k, None)
 
 
-def cached_response(ttl_seconds: int = 300, key_args: tuple = ()):
+def cached_response(ttl_seconds: int = 300, key_args: tuple = (), key_extra=None):
     """Decorator: cache the JSON response of a Flask handler.
 
     key_args: extra request.args names to include in the cache key.
+    key_extra: optional zero-arg callable evaluated per request; its str()
+    result joins the cache key. Needed when the response varies on something
+    that is NOT a query arg (e.g. the effective gap-only flag, which the
+    owner view forces via the X-View header) — without it, an internal body
+    could be served from cache to a request that needed a filtered one.
     Cache headers are added so clients also benefit from browser caching.
     """
     def decorator(fn):
@@ -120,7 +125,13 @@ def cached_response(ttl_seconds: int = 300, key_args: tuple = ()):
             if request.args.get('nocache') or request.headers.get('X-Bypass-Cache'):
                 return fn(*args, **kwargs)
             arg_part = '|'.join(f"{k}={request.args.get(k, '')}" for k in key_args)
-            cache_key = f"{fn.__name__}:{request.path}?{arg_part}:{json.dumps(kwargs, sort_keys=True, default=str)}"
+            extra_part = ''
+            if key_extra is not None:
+                try:
+                    extra_part = str(key_extra())
+                except Exception:
+                    extra_part = ''
+            cache_key = f"{fn.__name__}:{request.path}?{arg_part}:{extra_part}:{json.dumps(kwargs, sort_keys=True, default=str)}"
             hit = _cache_get(cache_key)
             if hit is not None:
                 val, code = hit
@@ -488,6 +499,11 @@ _OWNER_ALLOWED_PATHS = {
     '/api/top100/priority': frozenset(('POST',)),
     '/api/top100/status': frozenset(('POST',)),
     '/api/top100/funnel': frozenset(('GET', 'HEAD')),
+    # Excel round-trip: the owner edits the downloaded top100.xlsx and posts
+    # it back. Writes ride the SAME audited resequence path as /priority.
+    # NOTE: /api/crm/store/<n>/contacts/history is INTERNAL ONLY (contact
+    # identities never reach the owner) and is deliberately NOT listed here.
+    '/api/top100/import-xlsx': frozenset(('POST',)),
     '/api/changes': frozenset(('GET', 'HEAD')),
     '/api/conversion': frozenset(('GET', 'HEAD')),
     '/api/reconcile': frozenset(('GET', 'HEAD')),
@@ -17486,6 +17502,51 @@ def api_crm_store_full(store_number):
     })
 
 
+# The three /log contact fields whose history the restore UI shows.
+CONTACT_HISTORY_FIELDS = ('manager_name', 'asst_manager_name', 'spirits_ambassador')
+
+
+@app.route('/api/crm/store/<int:store_number>/contacts/history', methods=['GET'])
+def api_crm_store_contacts_history(store_number):
+    """Mistake-proofing for the /log contact fields: per field, the current
+    value plus up to 10 prior changes [{old, new, changed_by, changed_at}]
+    from territory_status_history (written by PUT /api/stores/<id>, which
+    audits every contact:<field> save old -> new, both DB branches). Nothing
+    is ever hard-deleted — blanking a name keeps the prior value one tap
+    away; Restore is a normal audited update back to the old value.
+
+    INTERNAL ONLY: contact identities never reach the owner, so this path is
+    deliberately ABSENT from the owner allowlist — the fail-closed hook 403s
+    any owner-view request before it gets here."""
+    store = db_fetchone(
+        "SELECT id, store_number, manager_name, asst_manager_name, "
+        "spirits_ambassador FROM stores WHERE store_number=?", (store_number,))
+    if not store:
+        return jsonify({'error': 'store not found'}), 404
+    s = row_to_dict(store)
+    contacts = {}
+    for field in CONTACT_HISTORY_FIELDS:
+        rows = [row_to_dict(r) for r in db_fetchall(
+            "SELECT old_value, new_value, changed_by, "
+            "CAST(changed_at AS TEXT) AS changed_at "
+            "FROM territory_status_history "
+            "WHERE store_number=? AND field=? "
+            "ORDER BY changed_at DESC, id DESC LIMIT 10",
+            (store_number, f'contact:{field}'))]
+        history = [{'old': d['old_value'], 'new': d['new_value'],
+                    'changed_by': d['changed_by'], 'changed_at': d['changed_at']}
+                   for d in rows]
+        current = s.get(field) or ''
+        # The restore candidate: the most recent prior value that is neither
+        # blank nor what the field already says.
+        previous = next((h['old'] for h in history
+                         if h['old'] and h['old'] != current), '')
+        contacts[field] = {'current': current, 'previous': previous,
+                           'history': history}
+    return jsonify({'store_number': store_number, 'store_id': s['id'],
+                    'contacts': contacts})
+
+
 @app.route('/api/crm/resolve-store', methods=['GET'])
 def api_crm_resolve_store():
     """Smart store resolver — rep types address OR store# and we find the match.
@@ -22131,24 +22192,52 @@ _TOP100_ORDER_SQL = (
 )
 
 
+def _gap_only_request() -> bool:
+    """True when this request wants ONLY gap stores (skus_carried <= 1).
+
+    The owner view is ALWAYS gap-only — "our top 100 target stores with one
+    or no products". Internal callers opt in with ?gap_only=1 (parity)."""
+    if _owner_view():
+        return True
+    return (request.args.get('gap_only') or '').strip().lower() in ('1', 'true', 'yes')
+
+
+def _gap_filter(rows, carried):
+    """Keep territory rows carrying 0 or 1 of the tracked SKUs (a store with
+    no reading in either source carries nothing)."""
+    return [r for r in rows
+            if ((carried.get(int(r['store_number'])) or {})
+                .get('skus_carried', 0)) <= 1]
+
+
 @app.route('/api/top100', methods=['GET'])
 @owner_scope
-@cached_response(ttl_seconds=60)
+@cached_response(ttl_seconds=60, key_extra=_gap_only_request)
 def api_top100():
     """The top-100 board: territory stores by priority_rank (NULLS LAST),
     class, tier — capped 100 — each with latest SKU presence for both SKUs,
     SOD on-hand, live qty, last touchpoint, owner_status, conversion tag,
     plus the v2 ranking facts: skus_carried (0/1/2), carried_detail
-    (fresher-of-SOD/live units per brand + source) and geo_tier (CORE/OUTER)."""
+    (fresher-of-SOD/live units per brand + source) and geo_tier (CORE/OUTER).
+
+    Owner view (and internal ?gap_only=1) narrows the board to GAP stores
+    only — skus_carried <= 1 — BEFORE the 100 cap, so the owner's board is
+    the top 100 stores with one or no products. key_extra keeps the gap and
+    full boards on separate cache keys (X-View is a header, not a query arg,
+    so key_args alone could serve a full cached board to the owner)."""
+    gap_only = _gap_only_request()
     rows = [row_to_dict(r) for r in db_fetchall(
         "SELECT store_number, tier, class, account, address, city, postal, "
         "route_day, route_stop, priority_rank, owner_status, owner_status_note, "
         "CAST(owner_status_updated_at AS TEXT) AS owner_status_updated_at "
-        "FROM territory_stores WHERE active" + _TOP100_ORDER_SQL + "LIMIT 100")]
+        "FROM territory_stores WHERE active" + _TOP100_ORDER_SQL)]
 
     presence = _sod_latest_presence()
     live_maps = {sku: _live_latest_per_store(sku)[0] for sku in SOD_TRACKED_SKUS}
     carried = _carried_by_store(presence, live_maps)
+    if gap_only:
+        rows = _gap_filter(rows, carried)
+    rows = rows[:100]
     _empty_detail = dict({k: None for k in _BRAND_KEYS}, source=None)
     touches = _last_touchpoints()
     touch_first = _first_touchpoints()
@@ -22180,7 +22269,7 @@ def api_top100():
         d['carried_detail'] = c['carried_detail'] if c else dict(_empty_detail)
         d['geo_tier'] = _geo_tier(d.get('city'))
 
-    return jsonify({'count': len(rows), 'rows': rows,
+    return jsonify({'count': len(rows), 'gap_only': gap_only, 'rows': rows,
                     'owner_statuses': list(OWNER_STATUSES)})
 
 
@@ -22280,19 +22369,27 @@ def api_top100_status():
 
 @app.route('/api/top100/funnel', methods=['GET'])
 @owner_scope
-@cached_response(ttl_seconds=60)
+@cached_response(ttl_seconds=60, key_extra=_gap_only_request)
 def api_top100_funnel():
     """Conversion-by-priority: how many of the top-100 board reached each
-    owner_status (none -> listing_received -> order_received -> completed)."""
+    owner_status (none -> listing_received -> order_received -> completed).
+
+    Counts the SAME board /api/top100 shows: owner view (and internal
+    ?gap_only=1) counts only gap stores (skus_carried <= 1), filtered before
+    the 100 cap. key_extra keeps the two boards on separate cache keys."""
+    gap_only = _gap_only_request()
     rows = [row_to_dict(r) for r in db_fetchall(
         "SELECT store_number, owner_status FROM territory_stores WHERE active"
-        + _TOP100_ORDER_SQL + "LIMIT 100")]
+        + _TOP100_ORDER_SQL)]
+    if gap_only:
+        rows = _gap_filter(rows, _carried_by_store())
+    rows = rows[:100]
     funnel = {s: 0 for s in OWNER_STATUSES}
     for r in rows:
         key = r['owner_status'] if r['owner_status'] in funnel else 'none'
         funnel[key] += 1
-    return jsonify({'board_size': len(rows), 'funnel': funnel,
-                    'order': list(OWNER_STATUSES)})
+    return jsonify({'board_size': len(rows), 'gap_only': gap_only,
+                    'funnel': funnel, 'order': list(OWNER_STATUSES)})
 
 
 @app.route('/api/top100/rebalance', methods=['POST'])
@@ -22368,6 +22465,152 @@ def api_top100_rebalance():
                     'total_ranked': len(final_order)})
 
 
+# ── Excel round-trip: edited top100.xlsx back into the board ───────────────
+_XLSX_IMPORT_MAX_BYTES = 1024 * 1024  # 1 MB cap — the board export is ~20 KB
+# Header cell -> logical column, matched on the lowercased alphanumeric form
+# so 'Rank' / 'priority_rank' / 'Store #' / 'store_number' all round-trip.
+_XLSX_IMPORT_COLS = {
+    'store': 'store_number', 'storenumber': 'store_number',
+    'rank': 'rank', 'priorityrank': 'rank',
+    'ownerstatus': 'owner_status',
+}
+
+
+def _xlsx_header_key(value) -> str:
+    return re.sub(r'[^a-z0-9]', '', str(value or '').lower())
+
+
+def _xlsx_int(value):
+    """Cell -> int or None (blank). Excel loves 5.0; '5.5' or 'abc' raise."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    f = float(str(value).strip())
+    i = int(f)
+    if i != f:
+        raise ValueError(f'not an integer: {value!r}')
+    return i
+
+
+@app.route('/api/top100/import-xlsx', methods=['POST'])
+@require_app_origin
+def api_top100_import_xlsx():
+    """Round-trip the edited top100.xlsx export back into the board.
+
+    Multipart field 'file' (cap 1 MB). Rows match on Store #; a changed Rank
+    (blank = clear) and a changed Owner Status (must be one of the 4 valid
+    states) are applied through the SAME audited resequence path as
+    /api/top100/priority — every write lands in territory_status_history
+    (changed_by 'owner-xlsx' in owner view, 'internal-xlsx' otherwise) and
+    ranks stay unique sequential 1..N. Unknown stores and bad values are
+    skipped with reasons, never guessed. Owner-allowlisted (their board,
+    their two writable fields — same surface as /priority + /status)."""
+    f = request.files.get('file')
+    if f is None:
+        return jsonify({'error': "multipart field 'file' (.xlsx) is required"}), 400
+    blob = f.read(_XLSX_IMPORT_MAX_BYTES + 1)
+    if len(blob) > _XLSX_IMPORT_MAX_BYTES:
+        return jsonify({'error': 'file too large (1 MB cap)'}), 413
+    from openpyxl import load_workbook
+    try:
+        wb = load_workbook(io.BytesIO(blob), read_only=True, data_only=True)
+        ws = wb.active
+        rows_iter = ws.iter_rows(values_only=True)
+        header = next(rows_iter, None)
+    except Exception:
+        return jsonify({'error': 'not a readable .xlsx file'}), 400
+    if not header:
+        return jsonify({'error': 'empty workbook'}), 400
+    cols = {}
+    for idx, h in enumerate(header):
+        key = _XLSX_IMPORT_COLS.get(_xlsx_header_key(h))
+        if key and key not in cols:
+            cols[key] = idx
+    if 'store_number' not in cols or ('rank' not in cols and 'owner_status' not in cols):
+        return jsonify({'error': "header row must include a store number column "
+                                 "plus 'Rank' and/or 'Owner Status'"}), 400
+
+    current = {}
+    for r in db_fetchall("SELECT store_number, priority_rank, owner_status "
+                         "FROM territory_stores WHERE active"):
+        d = row_to_dict(r)
+        current[int(d['store_number'])] = d
+
+    def _cell(row, key):
+        idx = cols.get(key)
+        return row[idx] if (idx is not None and idx < len(row)) else None
+
+    skipped, rank_changes, status_changes = [], [], []
+    seen = set()
+    for row in rows_iter:
+        raw_sn = _cell(row, 'store_number')
+        if raw_sn is None or str(raw_sn).strip() == '':
+            continue  # blank spacer line
+        try:
+            sn = _xlsx_int(raw_sn)
+        except ValueError:
+            skipped.append({'store_number': str(raw_sn),
+                            'reason': 'bad store number'})
+            continue
+        if sn not in current:
+            skipped.append({'store_number': sn,
+                            'reason': 'not in the territory book'})
+            continue
+        if sn in seen:
+            skipped.append({'store_number': sn, 'reason': 'duplicate row'})
+            continue
+        seen.add(sn)
+        if 'rank' in cols:
+            try:
+                rank = _xlsx_int(_cell(row, 'rank'))
+                if rank is not None and rank < 1:
+                    skipped.append({'store_number': sn,
+                                    'reason': f'rank must be >= 1, got {rank}'})
+                elif rank != current[sn]['priority_rank']:
+                    rank_changes.append((sn, rank))
+            except ValueError:
+                skipped.append({'store_number': sn,
+                                'reason': f'bad rank {_cell(row, "rank")!r}'})
+        raw_status = _cell(row, 'owner_status')
+        if 'owner_status' in cols and raw_status is not None \
+                and str(raw_status).strip() != '':
+            status = str(raw_status).strip().lower()
+            if status not in OWNER_STATUSES:
+                skipped.append({'store_number': sn,
+                                'reason': f'invalid owner_status {str(raw_status).strip()!r}'})
+            elif status != (current[sn]['owner_status'] or 'none'):
+                status_changes.append((sn, status))
+
+    changed_by = 'owner-xlsx' if _owner_view() else 'internal-xlsx'
+    updated_stores = set()
+    # Clears first, then inserts in ascending target order — sequential
+    # insertion never displaces an already-placed lower rank, so every
+    # requested rank lands exactly where the sheet said.
+    rank_changes.sort(key=lambda c: (c[1] is not None, c[1] or 0, c[0]))
+    for sn, rank in rank_changes:
+        _apply_priority_resequence(sn, rank, changed_by)
+        updated_stores.add(sn)
+    for sn, status in status_changes:
+        db_execute(
+            "UPDATE territory_stores SET owner_status=?, "
+            "owner_status_updated_at=CURRENT_TIMESTAMP WHERE store_number=?",
+            (status, sn))
+        _territory_audit(sn, 'owner_status', current[sn]['owner_status'],
+                         status, changed_by)
+        updated_stores.add(sn)
+    db_commit()  # one transaction: every move + cascaded shift + audit row
+    _cache_invalidate('api_top100', 'api_top100_funnel', 'api_territory')
+    total_ranked = row_to_dict(db_fetchone(
+        "SELECT COUNT(*) AS n FROM territory_stores "
+        "WHERE active AND priority_rank IS NOT NULL"))['n']
+    _log_event('top100_import_xlsx', 'territory', 'board', changed_by, {
+        'updated': len(updated_stores), 'skipped': len(skipped),
+        'rank_changes': len(rank_changes), 'status_changes': len(status_changes),
+    })
+    return jsonify({'status': 'ok', 'updated': len(updated_stores),
+                    'skipped': skipped, 'total_ranked': total_ranked,
+                    'changed_by': changed_by})
+
+
 @app.route('/api/owner/check', methods=['POST'])
 def api_owner_check():
     """Server-side owner passcode check against the OWNER_PASSCODE env var.
@@ -22436,8 +22679,11 @@ def _api_json(view_name):
 def api_export_top100_xlsx():
     data = _api_json('api_top100')
     skus = sorted(SOD_TRACKED_SKUS.keys())
+    # Round-trip columns (POST /api/top100/import-xlsx matches by header):
+    # Store # is the key, Rank is EDITABLE, Owner Status is editable when the
+    # value is one of the four valid states. SKUs Carried is informational.
     headers = ['Rank', 'Store #', 'Account', 'City', 'Tier', 'Class',
-               'Route Day', 'Owner Status', 'Owner Note']
+               'Route Day', 'Owner Status', 'Owner Note', 'SKUs Carried']
     for sku in skus:
         b = SOD_TRACKED_SKUS[sku][0]
         headers += [f'{b} Listed', f'{b} SOD On-Hand', f'{b} Live Qty',
@@ -22447,7 +22693,8 @@ def api_export_top100_xlsx():
     for r in data.get('rows', []):
         row = [r.get('priority_rank'), r.get('store_number'), r.get('account'),
                r.get('city'), r.get('tier'), r.get('class'), r.get('route_day'),
-               r.get('owner_status'), r.get('owner_status_note')]
+               r.get('owner_status'), r.get('owner_status_note'),
+               r.get('skus_carried')]
         for sku in skus:
             sd = (r.get('skus') or {}).get(sku) or {}
             row += ['yes' if sd.get('listed') else 'no', sd.get('on_hand'),
