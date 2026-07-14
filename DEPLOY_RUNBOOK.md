@@ -8,7 +8,10 @@ Backend for Dripp Cann Spirits' two LCBO SKUs:
 | 0044451 | Dayaa | Dayaa Arak | $29.85 / 750 mL |
 
 Reps (internal roster): Ikshit, Vaneet, Ed, Namit. Owner-facing surfaces show
-every rep as just "Rep". Field-work attribution baseline: 2026-07-15.
+every rep as a GTA region label (GTA CENTRAL / GTA WEST / GTA NORTH /
+GTA EAST; unknown values collapse to "GTA") and the owner view is
+fail-closed: only the allowlisted endpoints respond, everything else under
+/api returns 403. Field-work attribution baseline: 2026-07-15.
 
 Local dev: `python3 app.py` → port **5070** (SQLite dev file `drippcan.db`).
 Frontend (`drippcan-web`) runs on port **3002** (`next dev -p 3002`).
@@ -34,6 +37,10 @@ Frontend (`drippcan-web`) runs on port **3002** (`next dev -p 3002`).
   - `SOD_CRON_TOKEN` — FRESH token; also stored as the GitHub Actions secret
   - `OWNER_PASSCODE` — FRESH strong passcode for the owner (brand) view
   - `RESEND_API_KEY` — email alerts + daily backup-to-email
+  - `ALERT_EMAIL_TO` — REQUIRED for the daily 02:00 ET backup-to-email.
+    Without it the backup silently skips ("data stored forever" breaks).
+    Verified missing on Render 2026-07-14 — set it in the same pass as the
+    deploy (the main session owns the Render dashboard step).
   - `CORS_ORIGINS` — optional; defaults already cover
     `https://drippcan-web.vercel.app` + `http://localhost:3002`
 - Verify `https://drippcan-tracker.onrender.com/healthz` responds (free tier
@@ -72,6 +79,25 @@ curl -X POST -H "Authorization: Bearer $SOD_CRON_TOKEN" $BASE/api/sod/cron
 - `GET /api/reconcile?days=7` → rows with per-source timestamps.
 - Owner view: `?view=owner` responses contain no rep names and no notes.
 - Frontend loads at `https://drippcan-web.vercel.app` against the Render API.
+
+## Data forever (backup layers)
+- **Neon is the primary forever store.** All production data lives in the
+  `drippcan` Neon Postgres project; the Render host is disposable.
+- **Daily 02:00 ET backup-to-email** (`start_backup_scheduler` in app.py)
+  emails a full JSON export of every CRM/audit/territory/live-engine table
+  as an attachment via Resend. It needs BOTH `RESEND_API_KEY` and
+  `ALERT_EMAIL_TO` set on Render — with either missing it silently skips.
+  Trigger a manual run any time: `POST /api/admin/run-backup-now` with
+  `X-Admin-Token`.
+- **Neon free-tier PITR window is ~6 hours** — point-in-time restore only
+  covers the same working day. The email backup is the long-horizon safety
+  net; the restore path is `POST /api/admin/import?mode=merge` with the
+  attachment.
+- **Retention guard:** `sod_inventory`, `lcbo_live_snapshots`, `activities`
+  and `territory_status_history` are append-only. No code path hard-deletes
+  from them (tests grep the source); the SOD snapshot rollback moves rows to
+  `sod_inventory_archive` instead of destroying them, and import
+  `mode=replace` refuses to truncate protected tables (falls back to merge).
 
 ## Standing rules
 - Postgres in production, SQLite only for local dev. Inventory and status

@@ -600,8 +600,9 @@ class TestConversion:
         assert not REP_NAME_RE.search(text), 'rep name leaked to owner view'
         rows = {r['store_number']: r for r in resp.get_json()['per_store']}
         conv = rows[conv_stores['conv']]
-        assert conv['rep'] == 'Rep'
-        assert conv['touch_description'].startswith('Rep visit on 2026-07-16')
+        # Owner mode v2: rep identity becomes the GTA region label
+        assert conv['rep'] == 'GTA CENTRAL'
+        assert conv['touch_description'].startswith('GTA CENTRAL visit on 2026-07-16')
 
     def test_conversion_never_500_on_garbage(self, ingested, client):
         resp = client.get('/api/conversion?days=banana&nocache=1')
@@ -751,7 +752,8 @@ class TestOwnerMode:
         touched = [s for s in body['stores'] if s['last_touchpoint']]
         assert touched, 'expected at least one store with a touchpoint'
         for s in touched:
-            assert s['last_touchpoint']['rep'] == 'Rep'
+            # v2: identity becomes a GTA region label, never a name
+            assert s['last_touchpoint']['rep'].startswith('GTA')
             assert s['last_touchpoint']['activity_type']  # type+date stay visible
             assert s['last_touchpoint']['created_at']
         for s in body['stores']:
@@ -803,7 +805,7 @@ class TestExports:
         assert headers and all(h for h in headers)
 
     def test_visits_export_internal_vs_owner(self, ingested, client):
-        # Plant an activity with an internal note to prove notes are stripped
+        # Plant an activity with an internal note to prove notes stay internal
         db = _db()
         rep_id = db.execute("SELECT id FROM reps WHERE name='Namit'").fetchone()[0]
         sn = db.execute("SELECT store_number FROM territory_stores "
@@ -826,10 +828,11 @@ class TestExports:
         assert 'Namit' in internal
         assert 'Secret shelf intel' in internal
 
-        owner = cells_text(client.get('/api/export/visits.xlsx?view=owner'))
-        assert not REP_NAME_RE.search(owner), 'rep name leaked in owner export'
-        assert 'Secret shelf intel' not in owner
-        assert 'Rep' in owner  # identity is anonymized, not deleted
+        # Owner mode v2 is FAIL-CLOSED: the visits export (rep-level activity
+        # detail) is not on the owner allowlist — 403, not a scrubbed copy.
+        owner_resp = client.get('/api/export/visits.xlsx?view=owner')
+        assert owner_resp.status_code == 403
+        assert owner_resp.get_json()['error'] == 'owner view: not permitted'
 
     def test_top100_export_is_owner_safe_too(self, ingested, client):
         resp = client.get('/api/export/top100.xlsx?view=owner')
@@ -905,14 +908,13 @@ class TestStorePage:
         for key in ('priority_rank', 'owner_status', 'tier', 'route_day'):
             assert key in t
 
-    def test_store_full_owner_view_is_scrubbed(self, page_store, client):
+    def test_store_full_owner_view_fails_closed(self, page_store, client):
+        # v2: the store page (contacts, notes, rep detail) is not on the
+        # owner allowlist — the owner gets 403, nothing to scrub.
         resp = client.get(f"/api/crm/store/{page_store['sn']}/full?view=owner")
-        assert resp.status_code == 200
-        text = resp.get_data(as_text=True)
-        assert not REP_NAME_RE.search(text)
-        body = resp.get_json()
-        assert body['store']['manager_name'] == ''  # contact names stay internal
-        assert body['contacts_last_update']['changed_by'] == 'Rep'
+        assert resp.status_code == 403
+        assert resp.get_json()['error'] == 'owner view: not permitted'
+        assert not REP_NAME_RE.search(resp.get_data(as_text=True))
 
 
 # ---------------------------------------------------------------------------

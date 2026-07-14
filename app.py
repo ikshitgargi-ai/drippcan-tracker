@@ -94,6 +94,17 @@ def _cache_put(key, val, code, ttl_seconds):
         _cache_store[key] = (datetime.utcnow().timestamp() + ttl_seconds, val, code)
 
 
+def _cache_invalidate(*view_names):
+    """Drop every cached response for the named view functions.
+
+    Rank/status writes must show on the very next board read, not after the
+    TTL runs out — cache keys start with the wrapped view's __name__."""
+    prefixes = tuple(f'{n}:' for n in view_names)
+    with _cache_lock:
+        for k in [k for k in _cache_store if k.startswith(prefixes)]:
+            _cache_store.pop(k, None)
+
+
 def cached_response(ttl_seconds: int = 300, key_args: tuple = ()):
     """Decorator: cache the JSON response of a Flask handler.
 
@@ -348,15 +359,33 @@ OWNER_STRIP_KEYS = frozenset((
     'manager_name', 'asst_manager_name', 'manager_phone', 'store_email',
     'spirits_ambassador', 'contacts', 'phone', 'email',
 ))
-# Keys whose VALUES identify a rep — replaced with the literal "Rep".
+# Keys whose VALUES identify a rep — replaced with a GTA region label.
 OWNER_REP_KEYS = frozenset((
     'rep', 'rep_name', 'changed_by', 'added_by', 'updated_by', 'observed_by',
 ))
 # Actor labels that are NOT rep identities — kept verbatim in owner view.
 _OWNER_NEUTRAL_ACTORS = frozenset((
     'owner', 'rep', 'admin', 'system', 'seed', 'seed-default', 'discovery',
-    'cron', 'manual', 'scheduler',
+    'cron', 'manual', 'scheduler', 'rebalance',
 ))
+
+# Owner mode v2: rep identities become GTA REGION labels (the owner sees WHERE
+# the field coverage is, never WHO). 'Ikshit Sharma' is the stale legacy row
+# that must map to the same region as 'Ikshit'. Any rep value not in this map
+# collapses to plain 'GTA'.
+OWNER_REP_LABELS = {
+    'Ikshit': 'GTA CENTRAL',
+    'Vaneet': 'GTA WEST',
+    'Ed': 'GTA NORTH',
+    'Namit': 'GTA EAST',
+    'Ikshit Sharma': 'GTA CENTRAL',
+}
+_OWNER_REP_LABELS_LOWER = {k.lower(): v for k, v in OWNER_REP_LABELS.items()}
+
+
+def _owner_region_label(name) -> str:
+    """Region label for a rep identity in the owner view; unknown reps → 'GTA'."""
+    return _OWNER_REP_LABELS_LOWER.get(str(name or '').strip().lower(), 'GTA')
 
 _owner_name_re_cache = None  # (compiled_regex, expires_epoch)
 
@@ -364,7 +393,7 @@ _owner_name_re_cache = None  # (compiled_regex, expires_epoch)
 def _owner_rep_name_re():
     """Word-boundary regex over every known rep name (default roster + reps
     table) — the safety net that scrubs names embedded in free-text values
-    (e.g. "Ikshit visit on 2026-07-16" -> "Rep visit on 2026-07-16").
+    (e.g. "Ikshit visit on 2026-07-16" -> "GTA CENTRAL visit on 2026-07-16").
     Built lazily (REP_ROSTER_DEFAULT is defined later in the module) and
     rebuilt every 5 minutes so newly added reps are covered too."""
     global _owner_name_re_cache
@@ -403,14 +432,15 @@ def _owner_sanitize(obj):
                 if not v or str(v).strip().lower() in _OWNER_NEUTRAL_ACTORS:
                     out[k] = v
                 else:
-                    out[k] = 'Rep'
+                    out[k] = _owner_region_label(v)
             else:
                 out[k] = _owner_sanitize(v)
         return out
     if isinstance(obj, list):
         return [_owner_sanitize(x) for x in obj]
     if isinstance(obj, str) and obj:
-        return _owner_rep_name_re().sub('Rep', obj)
+        return _owner_rep_name_re().sub(
+            lambda m: _owner_region_label(m.group(0)), obj)
     return obj
 
 
@@ -439,6 +469,65 @@ def owner_scope(fn):
         clean.headers['X-View'] = 'owner'
         return clean
     return wrapped
+
+
+# ── OWNER MODE v2: FAIL-CLOSED ALLOWLIST ───────────────────────────────────
+# Sanitizing known endpoints is not enough — any endpoint NOT on this list
+# (rep-performance, rep-behaviour, activities, daily-log, manager, roster,
+# store-search, admin, sod admin, and anything added in the future) returns
+# 403 to the owner view. One hook kills every present and future leak.
+# Registered AFTER the rate limiter (before_request hooks run in
+# registration order: rate limit -> API key -> this).
+_OWNER_ALLOWED_PATHS = {
+    '/api/owner/check': frozenset(('POST',)),
+    # Territory list only — NOT /api/territory/ingest, NOT /api/territory/discovery*
+    '/api/territory': frozenset(('GET', 'HEAD')),
+    # Top-100 board: the read + the owner's two writes + the funnel.
+    # /api/top100/rebalance is INTERNAL and deliberately NOT listed.
+    '/api/top100': frozenset(('GET', 'HEAD')),
+    '/api/top100/priority': frozenset(('POST',)),
+    '/api/top100/status': frozenset(('POST',)),
+    '/api/top100/funnel': frozenset(('GET', 'HEAD')),
+    '/api/changes': frozenset(('GET', 'HEAD')),
+    '/api/conversion': frozenset(('GET', 'HEAD')),
+    '/api/reconcile': frozenset(('GET', 'HEAD')),
+    '/api/crm/oos-risk': frozenset(('GET', 'HEAD')),
+    '/api/crm/dashboard': frozenset(('GET', 'HEAD')),
+    '/api/export/top100.xlsx': frozenset(('GET', 'HEAD')),
+    '/api/export/territory.xlsx': frozenset(('GET', 'HEAD')),
+    '/api/export/changes.xlsx': frozenset(('GET', 'HEAD')),
+    '/api/export/reconcile.xlsx': frozenset(('GET', 'HEAD')),
+}
+_OWNER_ALLOWED_PREFIXES = (
+    ('/api/crm/sku-trend/', frozenset(('GET', 'HEAD'))),
+)
+
+
+def _owner_path_allowed(path: str, method: str) -> bool:
+    path = (path.rstrip('/') or '/')
+    methods = _OWNER_ALLOWED_PATHS.get(path)
+    if methods is not None:
+        return method in methods
+    for prefix, pmethods in _OWNER_ALLOWED_PREFIXES:
+        if path.startswith(prefix) and method in pmethods:
+            return True
+    return False
+
+
+@app.before_request
+def _owner_fail_closed():
+    """When the request rides the owner view (X-View: owner or ?view=owner),
+    ONLY the allowlisted paths are reachable under /api. Everything else is
+    403 — fail closed, so future endpoints can never leak to the owner."""
+    if not request.path.startswith('/api'):
+        return
+    if request.method == 'OPTIONS':
+        return  # CORS preflight carries no data
+    if not _owner_view():
+        return
+    if _owner_path_allowed(request.path, request.method):
+        return
+    return jsonify({'error': 'owner view: not permitted'}), 403
 
 
 @app.after_request
@@ -1892,7 +1981,13 @@ def api_store_snapshot(store_id):
 
 @app.route('/api/reps')
 def api_reps():
-    rows = db_fetchall("SELECT * FROM reps ORDER BY name")
+    # Roster lists show ONLY the official roster. The stale legacy row
+    # 'Ikshit Sharma' stays in the DB (nothing is ever deleted) but is
+    # filtered out of every roster/picker payload.
+    ph_list = ','.join(['?'] * len(REP_ROSTER_DEFAULT))
+    rows = db_fetchall(
+        f"SELECT * FROM reps WHERE TRIM(name) IN ({ph_list}) ORDER BY name",
+        list(REP_ROSTER_DEFAULT))
     return jsonify([dict(r) for r in rows])
 
 
@@ -2006,10 +2101,13 @@ def api_dashboard():
         ORDER BY a.created_at DESC LIMIT 20
     """)
 
-    by_rep = db_fetchall("""
+    _roster_ph = ','.join(['?'] * len(REP_ROSTER_DEFAULT))
+    by_rep = db_fetchall(f"""
         SELECT r.name, COUNT(a.id) as count FROM reps r
-        LEFT JOIN activities a ON r.id=a.rep_id GROUP BY r.id, r.name
-    """)
+        LEFT JOIN activities a ON r.id=a.rep_id
+        WHERE TRIM(r.name) IN ({_roster_ph})
+        GROUP BY r.id, r.name
+    """, list(REP_ROSTER_DEFAULT))
 
     active_stores = db_fetchone("SELECT COUNT(DISTINCT store_id) as c FROM activities")
     active_stores = active_stores['c'] if isinstance(active_stores, dict) else active_stores[0]
@@ -7365,10 +7463,27 @@ _EXPORT_TABLES = [
     ('sod_listing_changes',        'id'),
     ('sod_store_sku_changes',      'id'),
     ('sod_sync_runs',              'id'),
+    # Territory book + live lcbo.com engine (Dripp finalization 2026-07-14:
+    # the backup covers EVERY new table — "data stored forever" holds).
+    ('territory_stores',           'id'),
+    ('territory_status_history',   'id'),
+    ('lcbo_live_batches',          'id'),
+    ('lcbo_live_snapshots',        'id'),
+    ('live_listing_events',        'id'),
+    ('rep_listing_observations',   'id'),
     # Optional (large)
     ('sod_inventory',              None),  # 1M+ rows, only included with ?include=all
     ('inventory_history',          None),
 ]
+
+# RETENTION GUARD — these tables are append-only records of what happened.
+# No code path may DELETE or TRUNCATE them (soft-delete/archive only); the
+# import 'replace' mode falls back to merge for them, and
+# tests/test_finalize.py greps the source to keep it that way.
+_RETENTION_PROTECTED_TABLES = frozenset((
+    'sod_inventory', 'lcbo_live_snapshots', 'activities',
+    'territory_status_history',
+))
 
 
 # NB: _admin_token_ok / require_admin_token / require_app_origin are defined
@@ -7467,18 +7582,24 @@ def api_admin_import():
             continue
         ins = upd = skip = 0
         err = None
+        # RETENTION GUARD: 'replace' NEVER truncates a protected table —
+        # those are append-only history. Fall back to merge (upsert) so the
+        # import still lands without destroying what is already there.
+        table_mode = mode
+        if mode == 'replace' and tname in _RETENTION_PROTECTED_TABLES:
+            table_mode = 'merge' if pk else 'append'
         try:
             if USE_POSTGRES:
                 cur = db.cursor()
-                if mode == 'replace':
+                if table_mode == 'replace':
                     cur.execute(f"TRUNCATE TABLE {tname} RESTART IDENTITY CASCADE")
                 placeholders = ','.join(['%s'] * len(cols))
                 col_list = ','.join(cols)
-                if mode == 'merge' and pk:
+                if table_mode == 'merge' and pk:
                     update_set = ','.join(f"{c}=EXCLUDED.{c}" for c in cols if c != pk)
                     sql = (f"INSERT INTO {tname} ({col_list}) VALUES ({placeholders}) "
                            f"ON CONFLICT ({pk}) DO UPDATE SET {update_set}")
-                elif mode == 'append' and pk:
+                elif pk and table_mode != 'replace':
                     sql = f"INSERT INTO {tname} ({col_list}) VALUES ({placeholders}) ON CONFLICT ({pk}) DO NOTHING"
                 else:
                     sql = f"INSERT INTO {tname} ({col_list}) VALUES ({placeholders})"
@@ -7501,11 +7622,11 @@ def api_admin_import():
                 cur.close()
             else:
                 # SQLite path (dev only)
-                if mode == 'replace':
-                    db.execute(f"DELETE FROM {tname}")
+                if table_mode == 'replace':
+                    db.execute(f"DELETE FROM {tname}")  # never a protected table (guard above)
                 placeholders = ','.join(['?'] * len(cols))
                 col_list = ','.join(cols)
-                verb = 'INSERT OR REPLACE' if mode == 'merge' else ('INSERT OR IGNORE' if mode == 'append' else 'INSERT')
+                verb = 'INSERT OR REPLACE' if table_mode == 'merge' else ('INSERT OR IGNORE' if table_mode == 'append' else 'INSERT')
                 sql = f"{verb} INTO {tname} ({col_list}) VALUES ({placeholders})"
                 for r in rows:
                     vals = tuple(r.get(c) for c in cols)
@@ -7523,6 +7644,9 @@ def api_admin_import():
         except Exception as e:
             err = f"{type(e).__name__}: {str(e)[:300]}"
         results[tname] = {'inserted': ins, 'updated': upd, 'skipped': skip, 'error': err}
+        if table_mode != mode:
+            results[tname]['mode'] = table_mode
+            results[tname]['note'] = 'retention guard: protected table is never truncated'
 
     return jsonify({
         'status': 'completed',
@@ -7567,7 +7691,9 @@ def api_admin_export_everything():
     include_history = request.args.get('include_history', '0') in ('1', 'true', 'yes')
 
     db = get_db()
-    cur = db.cursor() if USE_POSTGRES else db
+    # A real cursor in BOTH modes: sqlite3.Connection has no .description,
+    # so `cur = db` made every table dump error out in SQLite dev mode.
+    cur = db.cursor()
     buf = io.BytesIO()
 
     # Resolve which tables to dump
@@ -7589,6 +7715,13 @@ def api_admin_export_everything():
         ('sod_sync_runs',           'run_at',        'run_at DESC'),
         ('sod_store_sku_changes',   'change_date',   'change_date DESC, id DESC'),
         ('sod_listing_changes',     'change_date',   'change_date DESC, id DESC'),
+        # Territory book + live lcbo.com engine (small tables dump in full;
+        # the high-churn snapshot/event tables ride the same time window).
+        ('territory_stores',        None,            'store_number'),
+        ('territory_status_history', None,           'changed_at DESC, id DESC'),
+        ('lcbo_live_batches',       'started_at',    'started_at DESC'),
+        ('lcbo_live_snapshots',     'checked_at',    'checked_at DESC, id DESC'),
+        ('live_listing_events',     'detected_at',   'detected_at DESC, id DESC'),
     ]
     if include_sod:
         base_tables.append(('sod_inventory', 'snapshot_date', 'snapshot_date DESC, sku'))
@@ -7674,7 +7807,7 @@ def api_admin_export_everything():
         zf.writestr('README.md', '\n'.join(readme_lines))
         zf.writestr('manifest.json', json.dumps(manifest, indent=2, default=str))
 
-    if USE_POSTGRES: cur.close()
+    cur.close()
 
     buf.seek(0)
     fname = f"anu-export-{datetime.utcnow().strftime('%Y-%m-%d-%H%M')}.zip"
@@ -10132,18 +10265,51 @@ def api_admin_sod_upload_preview():
 
 
 # ───────────────────────────────────────────────────────────────────────
-# SOD ROLLBACK — delete a historical snapshot if it was wrongly uploaded.
-# DOES NOT touch the live sync data; only deletes a specific snapshot_date.
+# SOD ROLLBACK — retire a historical snapshot if it was wrongly uploaded.
+# RETENTION GUARD: nothing is ever hard-deleted. The rows are MOVED to an
+# append-only *_archive sibling table (created on first use), row counts
+# verified, all in one transaction. DOES NOT touch the live sync data.
 # ───────────────────────────────────────────────────────────────────────
+
+def _archive_then_remove(cur, table, where_sql, params):
+    """Move matching rows to <table>_archive instead of destroying them.
+
+    1. CREATE TABLE IF NOT EXISTS <table>_archive with the live table's
+       columns (empty clone — constraints deliberately not copied so
+       re-archiving overlapping data never conflicts).
+    2. Copy every matching row into the archive.
+    3. Remove them from the live table and VERIFY the removed count equals
+       the archived count — a mismatch raises, so the caller's transaction
+       rolls back and neither table changes.
+
+    This is the ONLY sanctioned way to take rows out of a protected table
+    (tests grep the source so no direct hard-delete can come back).
+    """
+    archive = f"{table}_archive"
+    cur.execute(
+        f"CREATE TABLE IF NOT EXISTS {archive} AS SELECT * FROM {table} WHERE 1=0")
+    cur.execute(
+        f"INSERT INTO {archive} SELECT * FROM {table} WHERE {where_sql}", params)
+    archived = cur.rowcount
+    cur.execute(f"DELETE FROM {table} WHERE {where_sql}", params)
+    removed = cur.rowcount
+    if removed != archived:
+        raise RuntimeError(
+            f"retention guard: archived {archived} rows but removed {removed} "
+            f"from {table} — rolling back, nothing changed")
+    return removed
+
+
 @app.route('/api/admin/sod/rollback-snapshot', methods=['POST'])
 @require_app_origin
 def api_admin_sod_rollback_snapshot():
-    """Delete all sod_inventory rows for a specific snapshot_date.
+    """Move all sod_inventory rows for a specific snapshot_date into
+    sod_inventory_archive (never a hard delete).
 
     Body: { snapshot_date: 'YYYY-MM-DD', confirm: true }
 
-    Refuses to delete unless confirm=true is set explicitly. Also logs an
-    event_log row so the deletion is auditable.
+    Refuses to run unless confirm=true is set explicitly. Also logs an
+    event_log row so the rollback is auditable.
     """
     body = request.get_json(silent=True) or {}
     snapshot_date = (body.get('snapshot_date') or '').strip()
@@ -10158,45 +10324,53 @@ def api_admin_sod_rollback_snapshot():
         return jsonify({'error': 'snapshot_date must be YYYY-MM-DD'}), 400
     if not confirm:
         return jsonify({
-            'error': 'confirm=true is required to actually delete',
+            'error': 'confirm=true is required to actually roll back',
             'snapshot_date': snapshot_date,
-            'note': 'Re-POST with {"confirm": true} to perform the deletion.',
+            'note': 'Re-POST with {"confirm": true} to archive the snapshot.',
         }), 400
 
-    deleted = 0
+    archived = 0
+    conn = None
     try:
         conn = _sod_get_conn()
         cur = conn.cursor()
-        if USE_POSTGRES:
-            cur.execute("DELETE FROM sod_inventory WHERE snapshot_date=%s", (snapshot_date,))
-            deleted = cur.rowcount
-            # Also remove any sod_listing_changes that fired for this snapshot
-            cur.execute(
-                "DELETE FROM sod_listing_changes WHERE change_date=%s "
-                "AND (old_status IS NULL OR old_status='') ",  # only synthetic baselines
-                (snapshot_date,))
-        else:
-            cur.execute("DELETE FROM sod_inventory WHERE snapshot_date=?", (snapshot_date,))
-            deleted = cur.rowcount
+        ph = '%s' if USE_POSTGRES else '?'
+        archived = _archive_then_remove(
+            cur, 'sod_inventory', f"snapshot_date={ph}", (snapshot_date,))
+        # The synthetic-baseline sod_listing_changes that fired for this
+        # snapshot are archived the same way (never hard-deleted).
+        _archive_then_remove(
+            cur, 'sod_listing_changes',
+            f"change_date={ph} AND (old_status IS NULL OR old_status='')",
+            (snapshot_date,))
         conn.commit()
         cur.close()
         conn.close()
     except Exception as e:
-        return jsonify({'error': f'delete failed: {e}'}), 500
+        if conn is not None:
+            try:
+                conn.rollback()
+                conn.close()
+            except Exception:
+                pass
+        return jsonify({'error': f'rollback failed: {e}'}), 500
 
     # Audit log
     try:
         _log_event('sod_snapshot_rolled_back', 'snapshot', snapshot_date,
                    actor=request.headers.get('X-User', 'admin'),
-                   payload={'deleted_rows': deleted})
+                   payload={'archived_rows': archived})
     except Exception:
         pass
 
     return jsonify({
         'status': 'ok',
         'snapshot_date': snapshot_date,
-        'deleted_rows': deleted,
-        'note': 'Snapshot removed from sod_inventory. /new-listings will no longer compare against this date.',
+        'archived_rows': archived,
+        # Back-compat: older callers read deleted_rows; the rows now live on
+        # in sod_inventory_archive instead of being destroyed.
+        'deleted_rows': archived,
+        'note': 'Snapshot moved to sod_inventory_archive. /new-listings will no longer compare against this date.',
     })
 
 
@@ -13165,6 +13339,7 @@ def api_crm_rep_dashboard(rep):
 
 # ------- CRM dashboard rollup — one-shot for the homepage -------
 @app.route('/api/crm/dashboard', methods=['GET'])
+@owner_scope
 @cached_response(ttl_seconds=60, key_args=())
 def api_crm_dashboard():
     """Everything the main CRM dashboard needs in one call.
@@ -13284,6 +13459,7 @@ def api_crm_dashboard():
 
 
 @app.route('/api/crm/sku-trend/<sku>', methods=['GET'])
+@owner_scope
 @cached_response(ttl_seconds=300, key_args=())
 def api_crm_sku_trend(sku):
     """Daily aggregates for a SKU over the last N days (default 90).
@@ -18875,6 +19051,11 @@ def api_crm_rep_performance():
             out[rep]['deals_lost'] = int(r[3] or 0)
             out[rep]['listings_won_in_window'] = int(r[4] or 0)
 
+    # Roster-only scoreboard: drop stale/legacy actor spellings (e.g. the old
+    # 'Ikshit Sharma' row) — the docstring promise is "each rep in the
+    # official roster", and legacy aliases must not show as a fifth rep.
+    out = {rep: e for rep, e in out.items() if rep in OFFICIAL_REPS}
+
     # Tasting → listing conversion rate per rep
     for rep, e in out.items():
         tastings = (e.get('activities_by_type') or {}).get('tasting', 0) + \
@@ -20029,20 +20210,28 @@ def api_crm_today(rep):
 
 @app.route('/api/crm/reps-with-stores', methods=['GET'])
 def api_crm_reps_with_stores():
-    """List reps from stores table + how many stores they cover."""
+    """List reps from stores table + how many stores they cover.
+
+    Filtered to the official roster: stale legacy values (e.g. the old
+    'Ikshit Sharma' spelling) never show in filter lists. The underlying
+    rows are untouched."""
     db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    roster_lower = [r.lower().strip() for r in REP_ROSTER_DEFAULT]
+    ph_list = ','.join([ph] * len(roster_lower))
     q = (
         "SELECT MIN(TRIM(rep)) AS rep, COUNT(*) AS store_count "
         "FROM stores WHERE rep IS NOT NULL AND TRIM(rep) <> '' "
+        f"AND LOWER(TRIM(rep)) IN ({ph_list}) "
         "GROUP BY LOWER(TRIM(rep)) ORDER BY store_count DESC"
     )
     if USE_POSTGRES:
         cur = db.cursor()
-        cur.execute(q)
+        cur.execute(q, roster_lower)
         rows = cur.fetchall()
         cur.close()
     else:
-        rows = db.execute(q).fetchall()
+        rows = db.execute(q, roster_lower).fetchall()
     return jsonify([{'rep': r[0], 'store_count': r[1]} for r in rows])
 
 
@@ -21779,6 +21968,158 @@ def api_conversion():
 
 OWNER_STATUSES = ('none', 'listing_received', 'order_received', 'completed')
 
+# ── FIX B: RANKING v2 — gap-first groups + geography tiers ─────────────────
+# The old default ranks were plain route order, which put 20 Brampton stores
+# that ALREADY carry stock at the top of the board. v2 ranks by opportunity:
+#   Group 1: stores carrying NEITHER SKU  (the whole point of the board)
+#   Group 2: stores carrying exactly ONE
+#   Group 3: stores carrying BOTH
+# and inside each group: CORE geography first, then class AAA>AA>A>B>C>'',
+# then tier routed>territory>discovered, then store number (stable).
+# "Carrying" uses the FRESHER of the latest SOD row and the latest live
+# lcbo.com row per store (a tie on date goes to live — intraday beats
+# start-of-day). Manual rank overrides are ALWAYS preserved (see
+# _manual_rank_stores) and every assignment is audited.
+
+GEO_CORE_CITIES = frozenset(c.lower() for c in (
+    'North York', 'Toronto', 'Etobicoke', 'Scarborough', 'East York', 'York',
+    'Vaughan', 'Maple', 'Woodbridge', 'Concord', 'Thornhill', 'Markham',
+    'Unionville', 'Richmond Hill', 'Aurora', 'Newmarket', 'King City',
+    'Kleinburg', 'Oak Ridges', 'Stouffville',
+))
+_RANK_CLASS_ORDER = {'AAA': 0, 'AA': 1, 'A': 2, 'B': 3, 'C': 4}  # '' -> 5
+_RANK_TIER_ORDER = {'routed': 0, 'territory': 1, 'discovered': 2}
+# Audit actors that mean "machine-assigned rank". Any OTHER actor on a
+# priority_rank audit row marks that store's rank as a MANUAL override that
+# /api/top100/rebalance must preserve.
+RANK_MACHINE_ACTORS = ('seed-default', 'rebalance')
+# Brand keys for carried_detail, in tracked-SKU order: ('phoenix', 'dayaa').
+_BRAND_KEYS = tuple(SOD_TRACKED_SKUS[s][0].lower() for s in sorted(SOD_TRACKED_SKUS))
+
+
+def _geo_tier(city) -> str:
+    """CORE (Toronto proper + the York-region spine) or OUTER (Mississauga,
+    Brampton and everything else)."""
+    return 'CORE' if str(city or '').strip().lower() in GEO_CORE_CITIES else 'OUTER'
+
+
+def _carried_by_store(presence=None, live_maps=None):
+    """Per-store SKU carrying — {store_number: {'skus_carried': 0|1|2,
+    'carried_detail': {'phoenix': units|None, 'dayaa': units|None,
+                       'source': 'sod'|'live'}}}.
+
+    Per (store, SKU) the FRESHER of the latest SOD row (start-of-day, date
+    precision) and the latest live lcbo.com row decides the units; a tie on
+    date goes to live. `source` names where the freshest reading used for
+    that store came from. Stores with no reading in either source are absent
+    (callers treat missing as carrying nothing)."""
+    if presence is None:
+        presence = _sod_latest_presence()
+    if live_maps is None:
+        live_maps = {sku: _live_latest_per_store(sku)[0] for sku in SOD_TRACKED_SKUS}
+    raw = {}
+    for sku in sorted(SOD_TRACKED_SKUS):
+        brand_key = SOD_TRACKED_SKUS[sku][0].lower()
+        sod_stores = (presence.get(sku) or {}).get('stores') or {}
+        live_stores = live_maps.get(sku) or {}
+        for sn in set(sod_stores) | set(live_stores):
+            s, l = sod_stores.get(sn), live_stores.get(sn)
+            sod_date = str(s.get('snapshot_date') or '')[:10] if s else ''
+            live_date = str(l.get('checked_at') or '')[:10] if l else ''
+            if l is not None and (s is None or live_date >= sod_date):
+                units, src, when = (l.get('qty') or 0), 'live', live_date
+            else:
+                units, src, when = (s.get('on_hand') or 0), 'sod', sod_date
+            d = raw.setdefault(sn, {
+                'detail': {k: None for k in _BRAND_KEYS},
+                'source': None,
+                '_marker': ('', -1),
+            })
+            d['detail'][brand_key] = units
+            marker = (when, 1 if src == 'live' else 0)  # live wins date ties
+            if marker >= d['_marker']:
+                d['_marker'] = marker
+                d['source'] = src
+    out = {}
+    for sn, d in raw.items():
+        detail = dict(d['detail'])
+        detail['source'] = d['source']
+        out[sn] = {
+            'skus_carried': sum(1 for k in _BRAND_KEYS if (d['detail'][k] or 0) > 0),
+            'carried_detail': detail,
+        }
+    return out
+
+
+def _rank_sort_key(row, carried):
+    """v2 default-ranking sort key: gap group, geography, class, tier, store#."""
+    sn = int(row['store_number'])
+    group = min((carried.get(sn) or {}).get('skus_carried', 0), 2)
+    return (
+        group,
+        0 if _geo_tier(row.get('city')) == 'CORE' else 1,
+        _RANK_CLASS_ORDER.get((row.get('class') or '').strip(), 5),
+        _RANK_TIER_ORDER.get((row.get('tier') or '').strip(), 3),
+        sn,
+    )
+
+
+def _manual_rank_stores():
+    """Store numbers whose priority_rank has at least one MANUAL audit entry
+    (changed_by outside RANK_MACHINE_ACTORS) — rebalance preserves these."""
+    rows = db_fetchall(
+        "SELECT DISTINCT store_number FROM territory_status_history "
+        "WHERE field='priority_rank' AND changed_by NOT IN (?,?)",
+        RANK_MACHINE_ACTORS)
+    return {int(row_to_dict(r)['store_number']) for r in rows}
+
+
+def _apply_priority_resequence(sn, rank, changed_by):
+    """Move one store to `rank` (or clear it with None) and re-sequence EVERY
+    ranked active store to unique sequential ranks 1..N.
+
+    Runs inside the caller's transaction (caller commits). This is what makes
+    duplicate ranks impossible: any pre-existing dupes/gaps (the two-rank-4s
+    bug) are healed on the way through. The moved store is audited under the
+    real actor; the mechanical shifts are audited as 'rebalance' so they never
+    read as manual overrides later.
+
+    Returns (final_rank, affected) where affected = [{store_number, old_rank,
+    rank}, ...] in new-rank order (rank None last) for every row that moved,
+    the target store always included."""
+    rows = [row_to_dict(r) for r in db_fetchall(
+        "SELECT store_number, priority_rank FROM territory_stores "
+        "WHERE active AND priority_rank IS NOT NULL "
+        "ORDER BY priority_rank, store_number")]
+    old_ranks = {int(r['store_number']): r['priority_rank'] for r in rows}
+    order = [s for s in (int(r['store_number']) for r in rows) if s != sn]
+    if rank is not None:
+        order.insert(max(0, min(rank - 1, len(order))), sn)
+    affected = []
+    final_rank = None
+    for pos, store in enumerate(order, start=1):
+        old = old_ranks.get(store)
+        if store == sn:
+            final_rank = pos
+            continue  # the target is written + audited below, under its actor
+        if old == pos:
+            continue
+        db_execute("UPDATE territory_stores SET priority_rank=? WHERE store_number=?",
+                   (pos, store))
+        _territory_audit(store, 'priority_rank', old, pos, 'rebalance')
+        affected.append({'store_number': store, 'old_rank': old, 'rank': pos})
+    old_target = old_ranks.get(sn)
+    if old_target != final_rank:
+        db_execute("UPDATE territory_stores SET priority_rank=? WHERE store_number=?",
+                   (final_rank, sn))
+    # The target write is ALWAYS audited (even a same-rank pin is a manual
+    # statement the next rebalance must respect).
+    _territory_audit(sn, 'priority_rank', old_target, final_rank, changed_by)
+    affected.append({'store_number': sn, 'old_rank': old_target, 'rank': final_rank})
+    affected.sort(key=lambda a: (a['rank'] is None, a['rank'] or 0, a['store_number']))
+    return final_rank, affected
+
+
 # Ranked stores first (manual + seed-default ranks), then AAA/AA class, then
 # tier. `(priority_rank IS NULL)` sorts false<true on BOTH Postgres and SQLite
 # — portable NULLS LAST.
@@ -21796,7 +22137,9 @@ _TOP100_ORDER_SQL = (
 def api_top100():
     """The top-100 board: territory stores by priority_rank (NULLS LAST),
     class, tier — capped 100 — each with latest SKU presence for both SKUs,
-    SOD on-hand, live qty, last touchpoint, owner_status and conversion tag."""
+    SOD on-hand, live qty, last touchpoint, owner_status, conversion tag,
+    plus the v2 ranking facts: skus_carried (0/1/2), carried_detail
+    (fresher-of-SOD/live units per brand + source) and geo_tier (CORE/OUTER)."""
     rows = [row_to_dict(r) for r in db_fetchall(
         "SELECT store_number, tier, class, account, address, city, postal, "
         "route_day, route_stop, priority_rank, owner_status, owner_status_note, "
@@ -21805,6 +22148,8 @@ def api_top100():
 
     presence = _sod_latest_presence()
     live_maps = {sku: _live_latest_per_store(sku)[0] for sku in SOD_TRACKED_SKUS}
+    carried = _carried_by_store(presence, live_maps)
+    _empty_detail = dict({k: None for k in _BRAND_KEYS}, source=None)
     touches = _last_touchpoints()
     touch_first = _first_touchpoints()
     listings = _new_listings_window('1970-01-01')
@@ -21830,6 +22175,10 @@ def api_top100():
         d['last_touchpoint'] = touches.get(sn)
         d['conversion'] = next(
             (skus[k]['conversion'] for k in sorted(skus) if skus[k]['conversion']), None)
+        c = carried.get(sn)
+        d['skus_carried'] = c['skus_carried'] if c else 0
+        d['carried_detail'] = c['carried_detail'] if c else dict(_empty_detail)
+        d['geo_tier'] = _geo_tier(d.get('city'))
 
     return jsonify({'count': len(rows), 'rows': rows,
                     'owner_statuses': list(OWNER_STATUSES)})
@@ -21846,7 +22195,13 @@ def _top100_actor(data):
 @require_app_origin
 def api_top100_priority():
     """Set (or clear, rank=null) a store's priority_rank. ALWAYS audited to
-    territory_status_history with changed_by ('owner' or the rep name)."""
+    territory_status_history with changed_by ('owner' or the rep name).
+
+    FIX B: the whole ranked list is re-sequenced to UNIQUE sequential ranks
+    1..N in the same transaction (duplicate ranks were what made arrow moves
+    feel broken). The response carries `affected` — the full re-sequenced
+    order of every row that moved — so the frontend can apply it
+    optimistically without a refetch."""
     data = request.get_json(silent=True) or {}
     try:
         sn = int(data.get('store_number'))
@@ -21868,14 +22223,15 @@ def api_top100_priority():
         return jsonify({'error': f'store {sn} is not in the territory book'}), 404
     old_rank = row_to_dict(row)['priority_rank']
     changed_by = _top100_actor(data)
-    db_execute("UPDATE territory_stores SET priority_rank=? WHERE store_number=?",
-               (rank, sn))
-    _territory_audit(sn, 'priority_rank', old_rank, rank, changed_by)
-    db_commit()
+    final_rank, affected = _apply_priority_resequence(sn, rank, changed_by)
+    db_commit()  # one transaction: the move + every cascaded shift + audits
+    _cache_invalidate('api_top100', 'api_top100_funnel', 'api_territory')
     _log_event('top100_priority', 'territory_store', sn, changed_by,
-               {'old': old_rank, 'new': rank})
+               {'old': old_rank, 'new': final_rank,
+                'requested': rank, 'resequenced': len(affected)})
     return jsonify({'status': 'ok', 'store_number': sn, 'old_rank': old_rank,
-                    'rank': rank, 'changed_by': changed_by})
+                    'rank': final_rank, 'changed_by': changed_by,
+                    'affected': affected})
 
 
 @app.route('/api/top100/status', methods=['POST'])
@@ -21915,6 +22271,7 @@ def api_top100_status():
         _territory_audit(sn, 'owner_status_note', old['owner_status_note'],
                          str(note), changed_by)
     db_commit()
+    _cache_invalidate('api_top100', 'api_top100_funnel', 'api_territory')
     _log_event('top100_status', 'territory_store', sn, changed_by,
                {'old': old['owner_status'], 'new': status})
     return jsonify({'status': 'ok', 'store_number': sn, 'owner_status': status,
@@ -21936,6 +22293,79 @@ def api_top100_funnel():
         funnel[key] += 1
     return jsonify({'board_size': len(rows), 'funnel': funnel,
                     'order': list(OWNER_STATUSES)})
+
+
+@app.route('/api/top100/rebalance', methods=['POST'])
+@require_app_origin
+def api_top100_rebalance():
+    """FIX B: recompute DEFAULT priority ranks with the v2 scoring (gap-first
+    groups, CORE geography first, class, tier) across the whole active book.
+
+    INTERNAL ONLY — admin token or app origin; this path is deliberately
+    absent from the owner allowlist, so X-View: owner gets 403 before it
+    ever reaches here.
+
+    Manual overrides are sacred: any store whose priority_rank has an audit
+    entry from a human actor (changed_by outside RANK_MACHINE_ACTORS) keeps
+    its current rank — including a manually CLEARED rank, which stays
+    cleared. Everything is re-sequenced to unique sequential ranks 1..N in
+    one transaction and every change is audited as changed_by='rebalance'."""
+    rows = [row_to_dict(r) for r in db_fetchall(
+        "SELECT store_number, tier, class, city, priority_rank "
+        "FROM territory_stores WHERE active")]
+    carried = _carried_by_store()
+    manual = _manual_rank_stores()
+
+    group_counts = {'none': 0, 'one': 0, 'both': 0}
+    for r in rows:
+        n = min((carried.get(int(r['store_number'])) or {}).get('skus_carried', 0), 2)
+        group_counts[('none', 'one', 'both')[n]] += 1
+
+    defaults = sorted(
+        (r for r in rows if int(r['store_number']) not in manual),
+        key=lambda r: _rank_sort_key(r, carried))
+    pinned = sorted(
+        (r for r in rows
+         if int(r['store_number']) in manual and r['priority_rank'] is not None),
+        key=lambda r: (r['priority_rank'], int(r['store_number'])))
+    # Manual stores with a cleared rank stay unranked — untouched below.
+
+    # Merge: walk final positions 1..N; a pinned store claims its own rank
+    # (collisions push the later pin down one), defaults fill the rest in
+    # scoring order. Result is unique sequential ranks by construction.
+    final_order = []
+    di = pi = 0
+    pos = 1
+    while di < len(defaults) or pi < len(pinned):
+        if pi < len(pinned) and (di >= len(defaults)
+                                 or pinned[pi]['priority_rank'] <= pos):
+            final_order.append(pinned[pi])
+            pi += 1
+        else:
+            final_order.append(defaults[di])
+            di += 1
+        pos += 1
+
+    rebalanced = 0
+    for new_rank, r in enumerate(final_order, start=1):
+        if r['priority_rank'] == new_rank:
+            continue
+        store = int(r['store_number'])
+        db_execute("UPDATE territory_stores SET priority_rank=? WHERE store_number=?",
+                   (new_rank, store))
+        _territory_audit(store, 'priority_rank', r['priority_rank'], new_rank,
+                         'rebalance')
+        rebalanced += 1
+    db_commit()  # one transaction for every move + its audit row
+    _cache_invalidate('api_top100', 'api_top100_funnel', 'api_territory')
+    preserved = sum(1 for r in rows if int(r['store_number']) in manual)
+    _log_event('top100_rebalance', 'territory', 'board', 'rebalance', {
+        'rebalanced': rebalanced, 'preserved': preserved,
+        'group_counts': group_counts, 'total_ranked': len(final_order),
+    })
+    return jsonify({'status': 'ok', 'rebalanced': rebalanced,
+                    'preserved': preserved, 'group_counts': group_counts,
+                    'total_ranked': len(final_order)})
 
 
 @app.route('/api/owner/check', methods=['POST'])
