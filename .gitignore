@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+lcbo_tracker.db
+.env
+.env.fly
+.env.local
+.admin-token.local
+.DS_Store
+*.db-journal
+*.db-wal
+lcbo_tracker.db-shm
+lcbo_tracker.db-wal

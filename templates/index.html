@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#b22222">
+<link rel="manifest" href="/static/manifest.json">
+<title>Anu Spirits — LCBO Tracker</title>
+<link rel="stylesheet" href="/static/style.css">
+<!-- Leaflet for the Map view (free OpenStreetMap tiles, no API key) -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+<script defer src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+</head>
+<body>
+<div id="app">
+  <nav id="sidebar">
+    <div class="logo">
+      <div class="brand-logo">
+        <svg width="42" height="42" viewBox="0 0 42 42" fill="none">
+          <rect width="42" height="42" rx="8" fill="#d4a574"/>
+          <text x="21" y="24" text-anchor="middle" fill="#b22222" font-size="16" font-weight="bold" font-family="serif">ANU</text>
+          <text x="21" y="34" text-anchor="middle" fill="#b22222" font-size="6" font-family="sans-serif">SPIRITS</text>
+        </svg>
+        <div>
+          <h2>Anu Spirits</h2>
+          <span class="brand-sub">LCBO Tracker Pro</span>
+        </div>
+      </div>
+    </div>
+    <div class="nav-items">
+      <button class="nav-btn active" data-view="dashboard" onclick="showView('dashboard')">
+        <span class="icon">&#9632;</span><span class="nav-label">Dashboard</span>
+      </button>
+      <button class="nav-btn" data-view="stores" onclick="showView('stores')">
+        <span class="icon">&#127979;</span><span class="nav-label">Stores</span>
+      </button>
+      <button class="nav-btn" data-view="log" onclick="showView('log')">
+        <span class="icon">&#10010;</span><span class="nav-label">Log</span>
+      </button>
+      <button class="nav-btn" data-view="inventory" onclick="showView('inventory')">
+        <span class="icon">&#128230;</span><span class="nav-label">Inventory</span>
+      </button>
+      <button class="nav-btn" data-view="gap" onclick="showView('gap')">
+        <span class="icon">&#128269;</span><span class="nav-label">Gap Report</span>
+      </button>
+      <button class="nav-btn" data-view="reorder" onclick="showView('reorder')">
+        <span class="icon">&#9888;</span><span class="nav-label">Reorder</span>
+      </button>
+      <button class="nav-btn" data-view="sod" onclick="showView('sod')">
+        <span class="icon">&#128202;</span><span class="nav-label">SOD Live</span>
+      </button>
+      <button class="nav-btn" data-view="reports" onclick="showView('reports')">
+        <span class="icon">&#128196;</span><span class="nav-label">Reports</span>
+      </button>
+      <button class="nav-btn" data-view="crm" onclick="showView('crm')">
+        <span class="icon">&#127919;</span><span class="nav-label">CRM</span>
+      </button>
+      <button class="nav-btn" data-view="map" onclick="showView('map')">
+        <span class="icon">&#128205;</span><span class="nav-label">Map</span>
+      </button>
+      <button class="nav-btn" data-view="oosrisk" onclick="showView('oosrisk')">
+        <span class="icon">&#9888;</span><span class="nav-label">OOS Risk</span>
+      </button>
+      <button class="nav-btn" data-view="opps" onclick="showView('opps')">
+        <span class="icon">&#128176;</span><span class="nav-label">Opportunities+</span>
+      </button>
+      <button class="nav-btn" data-view="goals" onclick="showView('goals')">
+        <span class="icon">&#127919;</span><span class="nav-label">Goals</span>
+      </button>
+      <button class="nav-btn" data-view="horeca" onclick="showView('horeca')">
+        <span class="icon">&#127863;</span><span class="nav-label">HORECA</span>
+      </button>
+      <button class="nav-btn" data-view="territories" onclick="showView('territories')">
+        <span class="icon">&#127760;</span><span class="nav-label">Territories</span>
+      </button>
+      <button class="nav-btn" data-view="routes" onclick="showView('routes')">
+        <span class="icon">&#128506;</span><span class="nav-label">Routes</span>
+      </button>
+      <button class="nav-btn" data-view="opportunities" onclick="showView('opportunities')">
+        <span class="icon">&#127919;</span><span class="nav-label">Opportunities</span>
+      </button>
+      <button class="nav-btn" data-view="followups" onclick="showView('followups')">
+        <span class="icon">&#128197;</span><span class="nav-label">Follow-Ups</span>
+      </button>
+      <button class="nav-btn" data-view="export" onclick="showView('export')">
+        <span class="icon">&#8615;</span><span class="nav-label">Export</span>
+      </button>
+    </div>
+    <div class="rep-selector">
+      <label>Active Rep</label>
+      <select id="activeRep" onchange="setActiveRep()"></select>
+    </div>
+    <div class="live-clock" id="liveClock"></div>
+  </nav>
+
+  <main id="content">
+
+    <!-- ===== DASHBOARD ===== -->
+    <section id="view-dashboard" class="view active">
+      <div class="view-header">
+        <h1>Dashboard</h1>
+        <div class="live-badge" id="dashLive">LIVE <span class="pulse"></span></div>
+      </div>
+      <div class="stats-grid" id="statsGrid"></div>
+      <div class="dashboard-grid">
+        <div class="card">
+          <h3>Recent Activity <span class="card-badge" id="recentCount"></span></h3>
+          <table class="data-table" id="recentTable">
+            <thead><tr><th>Date/Time</th><th>Rep</th><th>Store</th><th>Producer</th><th>Type</th><th>Notes</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h3>Rep Performance</h3>
+          <div id="repStats"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== STORES ===== -->
+    <section id="view-stores" class="view">
+      <div class="view-header">
+        <h1>All Stores <span class="header-count" id="storeCount"></span></h1>
+      </div>
+      <div class="filters">
+        <input type="text" id="storeSearch" placeholder="Search store #, name, city, manager..." oninput="debounceSearch()">
+        <select id="cityFilter" onchange="currentPage=1;loadStores()"><option value="">All Cities</option></select>
+        <select id="producerFilter" onchange="currentPage=1;loadStores()">
+          <option value="">All Producers</option>
+          <option value="NB Distillers">NB Distillers</option>
+          <option value="Anu Portfolio">Anu Portfolio</option>
+        </select>
+      </div>
+      <div class="card">
+        <table class="data-table" id="storesTable">
+          <thead><tr><th>Store #</th><th>Account</th><th>City</th><th>Manager</th><th>Phone</th><th>Status</th><th>Producer</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="pagination" id="pagination"></div>
+      </div>
+    </section>
+
+    <!-- ===== LOG ACTIVITY ===== -->
+    <section id="view-log" class="view">
+      <h1>Log Activity</h1>
+      <div class="log-layout">
+        <div class="card log-form-card">
+          <h3>New Activity Entry</h3>
+          <div class="form-group">
+            <label>Store</label>
+            <input type="text" id="logStoreSearch" placeholder="Type store # or name..." oninput="searchLogStore()" autocomplete="off">
+            <div id="logStoreResults" class="dropdown-results"></div>
+            <input type="hidden" id="logStoreId">
+            <div id="selectedStoreInfo" class="selected-store-info"></div>
+          </div>
+          <div class="form-group">
+            <label>Producer(s) <span class="hint">select one or more</span></label>
+            <div class="chip-group" id="producerChips">
+              <button class="chip" data-val="NB Distillers" onclick="toggleChip(this,'producer')">NB Distillers</button>
+              <button class="chip" data-val="Anu Portfolio" onclick="toggleChip(this,'producer')">Anu Portfolio</button>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Activity Type</label>
+            <div class="chip-group" id="activityChips">
+              <button class="chip" data-val="tasting" onclick="toggleChip(this,'activity')">&#127863; Tasting</button>
+              <button class="chip" data-val="site_visit" onclick="toggleChip(this,'activity')">&#128205; Site Visit</button>
+              <button class="chip" data-val="listing" onclick="toggleChip(this,'activity')">&#128196; Listing</button>
+              <button class="chip" data-val="email" onclick="toggleChip(this,'activity')">&#9993; Email</button>
+              <button class="chip" data-val="call" onclick="toggleChip(this,'activity')">&#128222; Call</button>
+              <button class="chip" data-val="follow_up" onclick="toggleChip(this,'activity')">&#128197; Follow-Up</button>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Venue Type <span class="hint">optional</span></label>
+            <div class="chip-group" id="venueChips">
+              <button class="chip" data-val="LCBO" onclick="toggleChip(this,'venue')">LCBO</button>
+              <button class="chip" data-val="Restaurant" onclick="toggleChip(this,'venue')">Restaurant</button>
+              <button class="chip" data-val="Bar" onclick="toggleChip(this,'venue')">Bar</button>
+              <button class="chip" data-val="Club" onclick="toggleChip(this,'venue')">Club</button>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Follow-Up Date <span class="hint">optional</span></label>
+            <input type="date" id="logFollowUpDate">
+          </div>
+          <div class="form-group">
+            <label>Notes</label>
+            <textarea id="logNotes" rows="4" placeholder="Conversation details, action items, observations..."></textarea>
+          </div>
+          <button class="btn-primary" onclick="submitActivity()">Log Activity</button>
+          <div id="logSuccess" class="success-msg" style="display:none">Activity logged &amp; saved!</div>
+        </div>
+        <div class="card log-history-card">
+          <h3>Account Snapshot</h3>
+          <div id="storeHistory"><p class="muted">Select a store to view its full history and last conversation</p></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== INVENTORY ===== -->
+    <section id="view-inventory" class="view">
+      <div class="view-header">
+        <h1>LCBO Inventory</h1>
+        <div class="live-badge">LCBO.COM <span class="pulse"></span></div>
+      </div>
+      <p class="view-desc">Track our products across LCBO stores. Click "Check Stock" to fetch live data from LCBO.com.</p>
+      <div class="inventory-grid" id="inventoryGrid"></div>
+      <div class="card" style="margin-top:20px">
+        <h3>Add Product to Track</h3>
+        <div class="form-row">
+          <div class="form-group"><label>Brand</label>
+            <select id="newProdBrand"><option>NB Distillers</option><option>Anu Portfolio</option></select>
+          </div>
+          <div class="form-group"><label>Product Name</label><input type="text" id="newProdName" placeholder="e.g. Rutland Square Gin"></div>
+        </div>
+        <div class="form-row">
+          <div class="form-group"><label>LCBO SKU</label><input type="text" id="newProdSku" placeholder="e.g. 46340"></div>
+          <div class="form-group"><label>Category</label>
+            <select id="newProdCat"><option>Spirits</option><option>Wine</option><option>Beer</option></select>
+          </div>
+        </div>
+        <button class="btn-primary" onclick="addProduct()">Add Product</button>
+      </div>
+    </section>
+
+    <!-- ===== ROUTES ===== -->
+    <section id="view-routes" class="view">
+      <div class="view-header">
+        <h1>Route Planner</h1>
+      </div>
+      <div class="route-header card">
+        <div class="route-home">
+          <span class="route-pin">&#128205;</span>
+          <div>
+            <strong>Rep Home Base</strong>
+            <div class="muted">181 Dundas St E, Toronto, ON</div>
+          </div>
+        </div>
+        <div class="route-filters">
+          <select id="routeDistrict" onchange="onDistrictChange()">
+            <option value="">All Districts</option>
+          </select>
+          <select id="routeCity" onchange="loadRoutes()">
+            <option value="">All Cities</option>
+          </select>
+          <select id="routeMaxKm" onchange="loadRoutes()">
+            <option value="">Any Distance</option>
+            <option value="5">Within 5 km</option>
+            <option value="10">Within 10 km</option>
+            <option value="25">Within 25 km</option>
+            <option value="50">Within 50 km</option>
+            <option value="100">Within 100 km</option>
+            <option value="200">Within 200 km</option>
+          </select>
+          <select id="routeSort" onchange="loadRoutes()">
+            <option value="distance">Sort: Nearest</option>
+            <option value="priority">Sort: Priority (needs visit)</option>
+            <option value="activity">Sort: Least Recent</option>
+          </select>
+          <select id="routeLimit" onchange="loadRoutes()">
+            <option value="20">Top 20</option>
+            <option value="50" selected>Top 50</option>
+            <option value="100">Top 100</option>
+            <option value="200">Top 200</option>
+          </select>
+        </div>
+      </div>
+      <div id="routeMapLink" style="margin-bottom:16px"></div>
+      <div id="geocodeBar" style="margin-bottom:12px; display:none" class="card">
+        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap">
+          <span class="muted" style="font-size:13px">Stores are using city-center coordinates. Geocode for accurate distances.</span>
+          <button onclick="geocodeStores()" id="geocodeBtn" class="btn-primary" style="font-size:12px; padding:6px 14px">Geocode Addresses</button>
+          <span id="geocodeStatus" class="muted" style="font-size:12px"></span>
+        </div>
+      </div>
+      <div id="districtSummary" style="margin-bottom:16px"></div>
+      <div class="card">
+        <h3>Target Stores <span class="card-badge" id="routeCount"></span></h3>
+        <table class="data-table" id="routesTable">
+          <thead><tr><th>Dist.</th><th>Store #</th><th>Account</th><th>Address</th><th>City</th><th>Last Visit</th><th>Visits</th><th>Navigate</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h3>Districts & Cities Coverage</h3>
+        <div id="citiesRoute"></div>
+      </div>
+    </section>
+
+    <!-- ===== OPPORTUNITIES ===== -->
+    <section id="view-opportunities" class="view">
+      <div class="view-header">
+        <h1>NB Distillers Opportunities</h1>
+        <div class="live-badge">TARGETS <span class="pulse"></span></div>
+      </div>
+      <p class="view-desc">Stores with 0 or 1 NB Distillers products stocked. Priority targets for Red Admiral Vodka &amp; Chak De Whisky.</p>
+      <div class="opp-stats" id="oppStats"></div>
+      <div class="card">
+        <div class="opp-tabs">
+          <button class="tab-btn active" onclick="showOppTab('zero', this)">No NB Products</button>
+          <button class="tab-btn" onclick="showOppTab('one', this)">Only 1 Product</button>
+          <button class="tab-btn" onclick="showOppTab('full', this)">Both Stocked</button>
+        </div>
+        <div id="oppZero" class="opp-tab-content active"></div>
+        <div id="oppOne" class="opp-tab-content" style="display:none"></div>
+        <div id="oppFull" class="opp-tab-content" style="display:none"></div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <h3>Daily Route Plan</h3>
+        <p class="muted" style="margin-bottom:12px">Optimized daily store visits for the week. 8 stores per day, grouped by city proximity.</p>
+        <div class="daily-plan-filters">
+          <select id="planDistrict" onchange="loadDailyPlan()">
+            <option value="GTA">GTA</option>
+            <option value="Golden Horseshoe">Golden Horseshoe</option>
+            <option value="Southwestern">Southwestern</option>
+            <option value="Eastern">Eastern</option>
+            <option value="Northern">Northern</option>
+          </select>
+          <select id="planStoresPerDay" onchange="loadDailyPlan()">
+            <option value="6">6 stores/day</option>
+            <option value="8" selected>8 stores/day</option>
+            <option value="10">10 stores/day</option>
+            <option value="12">12 stores/day</option>
+          </select>
+        </div>
+        <div id="dailyPlanGrid"></div>
+      </div>
+    </section>
+
+    <!-- ===== GAP REPORT ===== -->
+    <section id="view-gap" class="view">
+      <div class="view-header">
+        <h1>Listing Gap Report</h1>
+        <div class="live-badge">LIVE <span class="pulse"></span></div>
+      </div>
+      <p class="view-desc">For each tracked product — LCBO stores in your CRM that are NOT carrying it. These are listing opportunities.</p>
+      <div class="filters">
+        <button class="btn-primary" onclick="refreshLiveInventoryAll()">&#128260; Refresh Live Inventory (All Products)</button>
+        <select id="gapSkuFilter" onchange="loadGapReport()"><option value="">All Products</option></select>
+        <input type="text" id="gapCityFilter" placeholder="Filter by city..." oninput="debounceGapReload()">
+      </div>
+      <div id="listingStatusBar" class="listing-status-bar"></div>
+      <div id="gapReportContent"><p class="muted">Click "Refresh Live Inventory" to populate.</p></div>
+    </section>
+
+    <!-- ===== REORDER NEEDED ===== -->
+    <section id="view-reorder" class="view">
+      <div class="view-header">
+        <h1>Reorder Needed</h1>
+        <div class="live-badge">LIVE <span class="pulse"></span></div>
+      </div>
+      <p class="view-desc">Stores with low stock on your tracked products. Prioritized by urgency: critical (0 units), high (&le;2), medium (below threshold).</p>
+      <div class="filters">
+        <label class="inline-label">Threshold
+          <input type="number" id="reorderThreshold" value="5" min="1" max="50" onchange="loadReorderReport()" style="width:70px;margin-left:6px">
+        </label>
+        <select id="reorderSkuFilter" onchange="loadReorderReport()"><option value="">All Products</option></select>
+        <input type="text" id="reorderCityFilter" placeholder="Filter by city..." oninput="debounceReorderReload()">
+      </div>
+      <div class="stats-grid" id="reorderStats"></div>
+      <div class="card">
+        <h3>Reorder Alerts <span class="card-badge" id="reorderCount"></span></h3>
+        <table class="data-table" id="reorderTable">
+          <thead><tr><th>Urgency</th><th>Store #</th><th>Store Name</th><th>City</th><th>Product</th><th>Qty</th><th>Manager</th><th>Phone</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ===== SOD LIVE (Sale of Data daily feed from LCBO) ===== -->
+    <section id="view-sod" class="view">
+      <div class="view-header">
+        <h1>SOD Live &mdash; LCBO Daily Feed</h1>
+        <div class="live-badge">LIVE <span class="pulse"></span></div>
+      </div>
+      <p class="view-desc">Official LCBO Sale-of-Data feed &mdash; ingested nightly from <code>sod.lcbo.com</code>. Every SKU, every store, every day. Filtered to Anu &amp; NB Distillers products for reports.</p>
+      <div class="sod-status-grid" id="sodStatusGrid"></div>
+      <div class="filters">
+        <button class="btn-primary" onclick="triggerSodSync()" id="sodSyncBtn">&#128260; Sync Now (Daily A + B)</button>
+        <button class="btn-secondary" onclick="loadSodStatus()">Refresh Status</button>
+      </div>
+      <div class="dashboard-grid">
+        <div class="card">
+          <h3>Tracked Products Snapshot <span class="card-badge" id="sodProdCount"></span></h3>
+          <table class="data-table" id="sodProductsTable">
+            <thead><tr><th>Brand</th><th>Product</th><th>SKU</th><th>Status</th><th>Stores</th><th>On-Hand</th><th>Trend</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h3>Listing Changes <span class="card-badge" id="sodChangeCount"></span></h3>
+          <div class="filters-inline">
+            <label class="inline-label">Window
+              <select id="sodChangeDays" onchange="loadSodListingChanges()" style="margin-left:6px">
+                <option value="7">7 days</option>
+                <option value="30" selected>30 days</option>
+                <option value="90">90 days</option>
+                <option value="365">1 year</option>
+              </select>
+            </label>
+            <label class="inline-label">Type
+              <select id="sodChangeType" onchange="loadSodListingChanges()" style="margin-left:6px">
+                <option value="">All</option>
+                <option value="NEW_LISTING">New Listings</option>
+                <option value="DELISTED">Delistings</option>
+                <option value="RELISTED">Re-listings</option>
+                <option value="BASELINE">Baseline</option>
+              </select>
+            </label>
+          </div>
+          <table class="data-table" id="sodChangesTable">
+            <thead><tr><th>Date</th><th>Type</th><th>Brand</th><th>Product</th><th>Old</th><th>New</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card" id="sodRecentRunsCard">
+        <h3>Recent Sync Runs</h3>
+        <table class="data-table" id="sodRunsTable">
+          <thead><tr><th>When</th><th>Source</th><th>File</th><th>Snapshot</th><th>Status</th><th>Rows</th><th>Anu Rows</th><th>+Listings</th><th>&ndash;Listings</th><th>Duration</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ===== REPORTS (Daily / Weekly / Monthly / Rep) ===== -->
+    <section id="view-reports" class="view">
+      <div class="view-header">
+        <h1>Reports</h1>
+        <div class="live-badge">LIVE <span class="pulse"></span></div>
+      </div>
+      <p class="view-desc">Daily, weekly, and monthly summaries of SOD data + per-rep performance. Backed by the SOD feed &mdash; refreshed automatically every night.</p>
+      <div class="filters">
+        <div class="fu-filter-bar">
+          <button class="tab-btn active" onclick="loadReport('daily', this)">Daily</button>
+          <button class="tab-btn" onclick="loadReport('weekly', this)">Weekly (7 days)</button>
+          <button class="tab-btn" onclick="loadReport('monthly', this)">Monthly (MTD)</button>
+          <button class="tab-btn" onclick="loadRepReport(this)">Per-Rep</button>
+        </div>
+      </div>
+      <div id="reportContent"><p class="muted">Select a report above.</p></div>
+    </section>
+
+    <!-- ===== FOLLOW-UPS ===== -->
+    <section id="view-followups" class="view">
+      <div class="view-header">
+        <h1>Follow-Up Tracker</h1>
+        <div class="live-badge" id="fuLive">LIVE <span class="pulse"></span></div>
+      </div>
+      <div class="followup-stats" id="followupStats"></div>
+      <div class="fu-filter-bar">
+        <button class="tab-btn active" onclick="loadFollowups('pending', this)">Pending</button>
+        <button class="tab-btn" onclick="loadFollowups('completed', this)">Completed</button>
+        <button class="tab-btn" onclick="loadFollowups('all', this)">All</button>
+      </div>
+      <div class="card">
+        <div id="followupsList"><p class="muted">Loading follow-ups...</p></div>
+      </div>
+    </section>
+
+    <!-- ===== EXPORT ===== -->
+    <section id="view-export" class="view">
+      <h1>Export &amp; Data Backup</h1>
+      <div class="alert-info">All data is stored permanently. Every activity, note, and follow-up is logged with timestamps and never deleted. Export regularly for additional backup.</div>
+      <div class="export-grid">
+        <div class="card export-card">
+          <h3>&#128202; Pipeline Report</h3>
+          <p>All stores + activity counts + manager info + producer assignments</p>
+          <a href="/api/export/pipeline" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download CSV</a>
+        </div>
+        <div class="card export-card">
+          <h3>&#128203; Activity Log</h3>
+          <p>Every activity ever logged — rep, store, producer, type, notes, date/time</p>
+          <a href="/api/export/activities" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download CSV</a>
+        </div>
+        <div class="card export-card">
+          <h3>&#127979; Store Directory</h3>
+          <p>All store info — managers, contacts, phones, emails, producers</p>
+          <a href="/api/export/stores" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download CSV</a>
+        </div>
+        <div class="card export-card">
+          <h3>&#128190; Full Backup</h3>
+          <p>All data ever entered — activities, follow-ups, stores, inventory. Data is permanently stored in PostgreSQL cloud database and NEVER deleted.</p>
+          <a href="/api/export/backup" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:12px">Download Backup</a>
+        </div>
+      </div>
+      <div class="card" style="margin-top:20px">
+        <h3>&#128279; Google Sheets Live Sync</h3>
+        <p style="margin-bottom:12px">Paste in Google Sheets cell A1 — auto-refreshes hourly:</p>
+        <code class="code-block">=IMPORTDATA("https://lcbo-tracker.onrender.com/api/export/pipeline")</code>
+      </div>
+    </section>
+
+    <!-- ===== CRM DASHBOARD ===== -->
+    <section id="view-crm" class="view">
+      <div class="view-header">
+        <h1>CRM Command Center</h1>
+        <div class="live-badge">LIVE <span class="pulse"></span></div>
+      </div>
+      <p class="view-desc">One-glance view of tracked products, OOS risk, listing changes, territory health. Pulls from SOD daily feed + LCBO.com live data.</p>
+
+      <div id="crmKpiGrid" class="crm-kpi-grid">
+        <div class="kpi-card"><div class="kpi-label">Latest SOD Snapshot</div><div class="kpi-value" id="kpiSnapshot">—</div></div>
+        <div class="kpi-card alert"><div class="kpi-label">Brink-of-OOS Stores</div><div class="kpi-value" id="kpiOos">—</div><div class="kpi-sub">Tracked SKU listed but on_hand &le; 2</div></div>
+        <div class="kpi-card good"><div class="kpi-label">New Listings (7d)</div><div class="kpi-value" id="kpiNewListings">—</div></div>
+        <div class="kpi-card warn"><div class="kpi-label">Delistings (7d)</div><div class="kpi-value" id="kpiDelistings">—</div></div>
+      </div>
+
+      <div class="card crm-card">
+        <h3>Tracked Product Rollup</h3>
+        <div id="crmTrackedTable" class="scroll-x"></div>
+      </div>
+
+      <div class="crm-2col">
+        <div class="card crm-card">
+          <h3>Territory Coverage</h3>
+          <div id="crmTerritoryList"></div>
+        </div>
+        <div class="card crm-card">
+          <h3>Recent Listing Changes (last 14 days)</h3>
+          <div id="crmDigestTable" class="scroll-x"></div>
+        </div>
+      </div>
+
+      <div class="card crm-card">
+        <h3>Top Replacement Opportunities <span class="muted-small">(slow-moving competitors where we're not listed)</span></h3>
+        <div class="row-controls">
+          <label>For SKU:
+            <select id="oppsSku" onchange="loadOpportunitiesCompact()"></select>
+          </label>
+          <label>Territory:
+            <select id="oppsTerr" onchange="loadOpportunitiesCompact()"><option value="">All</option></select>
+          </label>
+          <label>Slow if on_hand &le;
+            <input type="number" id="oppsThreshold" value="3" min="0" max="20" style="width:60px" onchange="loadOpportunitiesCompact()">
+          </label>
+        </div>
+        <div id="oppsTable" class="scroll-x"></div>
+      </div>
+    </section>
+
+    <!-- ===== MAP VIEW ===== -->
+    <section id="view-map" class="view">
+      <div class="view-header">
+        <h1>Store Map</h1>
+        <div class="live-badge">LIVE <span class="pulse"></span></div>
+      </div>
+      <p class="view-desc">All LCBO stores in your CRM, colored by territory. Click a marker for details. Filter by territory or by tracked-SKU listing status.</p>
+      <div class="row-controls">
+        <label>Territory:
+          <select id="mapTerritory" onchange="reloadMap()"><option value="">All territories</option></select>
+        </label>
+        <label>Color by:
+          <select id="mapColorBy" onchange="reloadMap()">
+            <option value="territory">Territory</option>
+            <option value="status">Tracked-SKU Status</option>
+          </select>
+        </label>
+        <label>SKU:
+          <select id="mapSku" onchange="reloadMap()"></select>
+        </label>
+        <button class="btn-secondary" onclick="reloadMap()">&#x21bb; Reload</button>
+        <span id="mapCount" class="muted-small"></span>
+      </div>
+      <div id="storeMap" class="map-container"></div>
+      <div class="map-legend" id="mapLegend"></div>
+    </section>
+
+    <!-- ===== OOS RISK ===== -->
+    <section id="view-oosrisk" class="view">
+      <div class="view-header"><h1>Out-of-Stock Risk Watch</h1></div>
+      <p class="view-desc">Stores carrying our tracked SKU where on-hand stock is at or below threshold. Critical = 0 units, High = 1, Medium = 2.</p>
+      <div class="row-controls">
+        <label>SKU:
+          <select id="oosSku" onchange="loadOos()"></select>
+        </label>
+        <label>Territory:
+          <select id="oosTerr" onchange="loadOos()"><option value="">All</option></select>
+        </label>
+        <label>Threshold:
+          <input type="number" id="oosThreshold" value="2" min="0" max="20" style="width:60px" onchange="loadOos()">
+        </label>
+        <button class="btn-secondary" onclick="loadOos()">&#x21bb; Refresh</button>
+      </div>
+      <div id="oosTable" class="scroll-x"></div>
+    </section>
+
+    <!-- ===== OPPORTUNITIES (replacement finder) ===== -->
+    <section id="view-opps" class="view">
+      <div class="view-header"><h1>Opportunities — Replace Slow Movers</h1></div>
+      <p class="view-desc">For each tracked SKU, find stores where a competitor product in the same category is slow-moving (on_hand low) or being delisted. These are your highest-conversion pitch targets — same shelf, same category, our SKU bumps theirs.</p>
+      <div class="row-controls">
+        <label>Pitch our SKU:
+          <select id="oppsFullSku" onchange="loadOpportunitiesFull()"></select>
+        </label>
+        <label>Territory:
+          <select id="oppsFullTerr" onchange="loadOpportunitiesFull()"><option value="">All</option></select>
+        </label>
+        <label>Slow if on_hand &le;
+          <input type="number" id="oppsFullThreshold" value="3" min="0" max="20" style="width:60px" onchange="loadOpportunitiesFull()">
+        </label>
+        <button class="btn-secondary" onclick="loadOpportunitiesFull()">&#x21bb; Refresh</button>
+        <span id="oppsCount" class="muted-small"></span>
+      </div>
+      <div id="oppsFullTable" class="scroll-x"></div>
+    </section>
+
+    <!-- ===== GOALS ===== -->
+    <section id="view-goals" class="view">
+      <div class="view-header"><h1>Sales Goals</h1></div>
+      <p class="view-desc">Track listing & volume targets per SKU, territory, or rep. Progress is computed from the latest SOD snapshot.</p>
+
+      <div class="card crm-card">
+        <h3>New Goal</h3>
+        <form id="goalForm" onsubmit="event.preventDefault(); createGoal();" class="goal-form">
+          <label>Scope
+            <select id="goalScope" required>
+              <option value="sku">SKU</option>
+              <option value="territory">Territory</option>
+              <option value="rep">Rep</option>
+            </select>
+          </label>
+          <label>Target key
+            <input type="text" id="goalKey" required placeholder="e.g. 0020187 / TOR_CORE / Rep Name">
+          </label>
+          <label>Period start <input type="date" id="goalStart" required></label>
+          <label>Period end <input type="date" id="goalEnd" required></label>
+          <label>Target listings <input type="number" id="goalListings" value="0" min="0"></label>
+          <label>Target units <input type="number" id="goalUnits" value="0" min="0"></label>
+          <label>Target revenue <input type="number" id="goalRevenue" value="0" min="0" step="0.01"></label>
+          <label>Notes <input type="text" id="goalNotes" placeholder="Optional"></label>
+          <button type="submit" class="btn-primary">Save Goal</button>
+        </form>
+      </div>
+
+      <div class="card crm-card">
+        <h3>Active Goals — Live Progress</h3>
+        <div id="goalsTable" class="scroll-x"></div>
+      </div>
+    </section>
+
+    <!-- ===== HORECA ACCOUNTS ===== -->
+    <section id="view-horeca" class="view">
+      <div class="view-header"><h1>HORECA Accounts</h1></div>
+      <p class="view-desc">Hotels, Restaurants, Caterers, Bars. Track on-premise targets alongside LCBO retail.</p>
+
+      <div class="card crm-card">
+        <h3>New Account</h3>
+        <form id="horecaForm" onsubmit="event.preventDefault(); createHoreca();" class="horeca-form">
+          <label>Name <input type="text" id="hName" required></label>
+          <label>Type
+            <select id="hType">
+              <option value="restaurant">Restaurant</option>
+              <option value="bar">Bar</option>
+              <option value="hotel">Hotel</option>
+              <option value="catering">Catering</option>
+              <option value="club">Club / Lounge</option>
+            </select>
+          </label>
+          <label>Address <input type="text" id="hAddress"></label>
+          <label>City <input type="text" id="hCity"></label>
+          <label>Postal <input type="text" id="hPostal" placeholder="M5V 1J1"></label>
+          <label>Phone <input type="text" id="hPhone"></label>
+          <label>Email <input type="email" id="hEmail"></label>
+          <label>Contact <input type="text" id="hContact"></label>
+          <label>Title <input type="text" id="hTitle"></label>
+          <label>Status
+            <select id="hStatus">
+              <option value="prospect">Prospect</option>
+              <option value="active">Active</option>
+              <option value="dormant">Dormant</option>
+              <option value="lost">Lost</option>
+            </select>
+          </label>
+          <label>Priority
+            <select id="hPriority">
+              <option value="Standard">Standard</option>
+              <option value="High">High</option>
+              <option value="Top">Top</option>
+            </select>
+          </label>
+          <label>Products carried <input type="text" id="hProducts" placeholder="Red Admiral, Chak De"></label>
+          <label class="full-width">Notes <input type="text" id="hNotes"></label>
+          <button type="submit" class="btn-primary">Add Account</button>
+        </form>
+      </div>
+
+      <div class="card crm-card">
+        <h3>Accounts</h3>
+        <div class="row-controls">
+          <label>Filter type:
+            <select id="hFilterType" onchange="loadHoreca()">
+              <option value="">All types</option>
+              <option value="restaurant">Restaurant</option>
+              <option value="bar">Bar</option>
+              <option value="hotel">Hotel</option>
+              <option value="catering">Catering</option>
+              <option value="club">Club</option>
+            </select>
+          </label>
+          <label>Status:
+            <select id="hFilterStatus" onchange="loadHoreca()">
+              <option value="">Any</option>
+              <option value="prospect">Prospect</option>
+              <option value="active">Active</option>
+              <option value="dormant">Dormant</option>
+              <option value="lost">Lost</option>
+            </select>
+          </label>
+          <label>Territory:
+            <select id="hFilterTerr" onchange="loadHoreca()"><option value="">All</option></select>
+          </label>
+        </div>
+        <div id="horecaTable" class="scroll-x"></div>
+      </div>
+    </section>
+
+    <!-- ===== TERRITORIES ===== -->
+    <section id="view-territories" class="view">
+      <div class="view-header"><h1>Territories</h1></div>
+      <p class="view-desc">Ontario stores grouped by FSA postal code. Click "Reassign" if you've added new stores or want to recompute auto-assignments.</p>
+      <div class="row-controls">
+        <button class="btn-secondary" onclick="reassignTerritories()">&#x21bb; Re-run Auto-Assignment</button>
+      </div>
+      <div class="card crm-card">
+        <h3>Territory Coverage</h3>
+        <div id="terrTable" class="scroll-x"></div>
+      </div>
+    </section>
+
+    <!-- ===== STORE DETAIL MODAL ===== -->
+    <div id="storeModal" class="modal" style="display:none">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h2 id="modalTitle">Store Detail</h2>
+          <button class="close-btn" onclick="closeModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="detail-tabs">
+            <button class="tab-btn active" onclick="switchTab('snapshot', this)">Snapshot</button>
+            <button class="tab-btn" onclick="switchTab('info', this)">Info</button>
+            <button class="tab-btn" onclick="switchTab('contacts', this)">Contacts</button>
+            <button class="tab-btn" onclick="switchTab('activities', this)">Activities</button>
+          </div>
+
+          <!-- Snapshot Tab -->
+          <div id="tab-snapshot" class="tab-content active">
+            <div id="snapshotContent"><p class="muted">Loading account snapshot...</p></div>
+          </div>
+
+          <!-- Info Tab -->
+          <div id="tab-info" class="tab-content">
+            <form id="storeEditForm">
+              <input type="hidden" id="editStoreId">
+              <div class="form-row">
+                <div class="form-group"><label>Account</label><input type="text" id="editAccount"></div>
+                <div class="form-group"><label>Store #</label><input type="text" id="editStoreNum" disabled></div>
+              </div>
+              <div class="form-row">
+                <div class="form-group"><label>Address</label><input type="text" id="editAddress"></div>
+                <div class="form-group"><label>City</label><input type="text" id="editCity"></div>
+              </div>
+              <div class="form-row">
+                <div class="form-group"><label>Postal</label><input type="text" id="editPostal"></div>
+                <div class="form-group"><label>Producer</label>
+                  <select id="editProducer"><option value="">--</option><option>NB Distillers</option><option>Anu Portfolio</option><option>Both</option></select>
+                </div>
+              </div>
+              <div class="form-row">
+                <div class="form-group"><label>Priority</label>
+                  <select id="editPriority"><option>Standard</option><option>High</option><option>Low</option></select>
+                </div>
+                <div class="form-group"><label>Status</label>
+                  <select id="editStatus"><option value="">--</option><option>Not Active</option><option>Pitched</option><option>Won</option><option>Lost</option><option>Follow Up</option></select>
+                </div>
+              </div>
+              <div class="form-group"><label>Assigned Rep</label><input type="text" id="editRep"></div>
+              <button type="button" class="btn-primary" onclick="saveStore()">Save Changes</button>
+              <span class="success-msg" style="display:none">Saved!</span>
+            </form>
+          </div>
+
+          <!-- Contacts Tab -->
+          <div id="tab-contacts" class="tab-content">
+            <form id="contactsForm">
+              <div class="form-row">
+                <div class="form-group"><label>Manager Name</label><input type="text" id="editManagerName"></div>
+                <div class="form-group"><label>Asst. Manager</label><input type="text" id="editAsstManager"></div>
+              </div>
+              <div class="form-row">
+                <div class="form-group"><label>Manager Phone</label><input type="tel" id="editManagerPhone"></div>
+                <div class="form-group"><label>Store Email</label><input type="email" id="editStoreEmail"></div>
+              </div>
+              <div class="form-row">
+                <div class="form-group"><label>Store Phone</label><input type="tel" id="editPhone"></div>
+                <div class="form-group"><label>Other Contacts</label><input type="text" id="editContacts"></div>
+              </div>
+              <div class="form-group"><label>General Email</label><input type="text" id="editEmail"></div>
+              <button type="button" class="btn-primary" onclick="saveStore()">Save Contacts</button>
+              <span class="success-msg" style="display:none">Saved!</span>
+            </form>
+          </div>
+
+          <!-- Activities Tab -->
+          <div id="tab-activities" class="tab-content">
+            <div class="activity-filter-row">
+              <button class="filter-pill active" onclick="filterActivities('', this)">All</button>
+              <button class="filter-pill" onclick="filterActivities('tasting', this)">Tasting</button>
+              <button class="filter-pill" onclick="filterActivities('site_visit', this)">Site Visit</button>
+              <button class="filter-pill" onclick="filterActivities('listing', this)">Listing</button>
+              <button class="filter-pill" onclick="filterActivities('email', this)">Email</button>
+              <button class="filter-pill" onclick="filterActivities('call', this)">Call</button>
+            </div>
+            <div id="modalActivities"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
