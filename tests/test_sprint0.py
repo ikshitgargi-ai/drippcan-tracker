@@ -14,8 +14,12 @@ import pytest
 
 # Force SQLite for tests so we don't touch production Postgres.
 os.environ.pop('DATABASE_URL', None)
-TEST_DB = '/tmp/lcbo_tracker_sprint0_test.db'
-os.environ['DB_PATH'] = TEST_DB
+# Isolate via DB_DIR (the env var app.py actually reads) so the test SQLite
+# file lands in /tmp, not the repo root.
+TEST_DB_DIR = '/tmp/drippcan_sprint0_test'
+os.makedirs(TEST_DB_DIR, exist_ok=True)
+os.environ['DB_DIR'] = TEST_DB_DIR
+TEST_DB = os.path.join(TEST_DB_DIR, 'drippcan.db')
 
 # Import the app fresh (and isolated) for each test session
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -101,7 +105,7 @@ class TestRepCarryingFiltersStatusL:
             )
 
         # First tracked SKU
-        first_sku = list(m.SOD_TRACKED_SKUS.keys())[0]  # e.g. '0020187'
+        first_sku = list(m.SOD_TRACKED_SKUS.keys())[0]  # e.g. '0014318' (Phoenix)
         snapshot_date = '2026-04-21'
 
         # Mark sod_products row as tracked
@@ -314,8 +318,17 @@ class TestFreshnessFromSnapshotDate:
         assert r.json['snapshot_age_days'] == 5
 
     def test_healthz_endpoint_consistent(self, app_module, client):
-        """/healthz uses the same freshness logic as /api/sod/health."""
+        """/healthz?deep=1 uses the same freshness logic as /api/sod/health.
+
+        Plain /healthz is a liveness probe (always 200 so uptime monitors and
+        the GitHub Action wake stay green); the strict freshness contract
+        lives behind ?deep=1.
+        """
         r = client.get('/healthz')
+        assert r.status_code == 200, 'liveness mode must stay 200 even when stale'
+        assert r.json['snapshot_age_days'] == 5
+
+        r = client.get('/healthz?deep=1')
         assert r.status_code == 503
         assert r.json['snapshot_age_days'] == 5
 

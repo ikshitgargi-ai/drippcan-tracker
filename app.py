@@ -1,3 +1,5 @@
+from __future__ import annotations  # 3.9-safe lazy annotations (str | None etc.)
+
 import os
 import io
 import csv
@@ -189,15 +191,14 @@ def api_admin_cache_clear():
     return jsonify({'cleared': n})
 
 # CORS — allow the Vercel-hosted Next.js frontend to call this backend.
-# Default origins: localhost dev + lcbo-tracker-web.vercel.app + Anu domain.
+# Default origins: localhost dev + drippcan-web.vercel.app.
 # Override via env var CORS_ORIGINS (comma-separated).
 try:
     from flask_cors import CORS
     _cors_origins = os.environ.get(
         'CORS_ORIGINS',
-        'http://localhost:3000,http://localhost:3001,'
-        'https://lcbo-tracker-web.vercel.app,'
-        'https://lcbo.anu-spirits.com'
+        'http://localhost:3002,http://127.0.0.1:3002,'
+        'https://drippcan-web.vercel.app'
     ).split(',')
     CORS(app, resources={r'/api/*': {'origins': _cors_origins},
                          r'/healthz': {'origins': _cors_origins}}, supports_credentials=False)
@@ -289,11 +290,9 @@ def require_admin_token(fn):
 
 
 _ALLOWED_ORIGINS = {
-    'https://lcbo-tracker-web.vercel.app',
-    'https://lcbo.anu-spirits.com',
-    'http://localhost:3000',
-    'http://localhost:3001',
-    'http://127.0.0.1:3000',
+    'https://drippcan-web.vercel.app',
+    'http://localhost:3002',
+    'http://127.0.0.1:3002',
 }
 
 
@@ -332,6 +331,116 @@ def require_app_origin(fn):
     return wrapped
 
 
+# ── OWNER MODE (server-side enforcement, not just UI hiding) ───────────────
+# The brand owner gets a limited view of the same app. Any request carrying
+# ?view=owner (or the X-View: owner header set by the owner UI) has its JSON
+# scrubbed SERVER-SIDE before it leaves the building:
+#   - every rep identity becomes just "Rep" (names never reach the owner),
+#   - internal notes (activities.notes, store_notes) are stripped,
+#   - store contact names/phones/emails stay internal.
+# Applies to territory, changes, conversion, top-100, reconcile and every
+# export. The owner keeps: inventory, listings/delistings, OOS risk, the
+# top-100 board (their two writable actions), the funnel, downloads.
+
+# Keys whose VALUES are internal notes / contact identity — blanked for owner.
+OWNER_STRIP_KEYS = frozenset((
+    'notes', 'store_notes', 'last_note',
+    'manager_name', 'asst_manager_name', 'manager_phone', 'store_email',
+    'spirits_ambassador', 'contacts', 'phone', 'email',
+))
+# Keys whose VALUES identify a rep — replaced with the literal "Rep".
+OWNER_REP_KEYS = frozenset((
+    'rep', 'rep_name', 'changed_by', 'added_by', 'updated_by', 'observed_by',
+))
+# Actor labels that are NOT rep identities — kept verbatim in owner view.
+_OWNER_NEUTRAL_ACTORS = frozenset((
+    'owner', 'rep', 'admin', 'system', 'seed', 'seed-default', 'discovery',
+    'cron', 'manual', 'scheduler',
+))
+
+_owner_name_re_cache = None  # (compiled_regex, expires_epoch)
+
+
+def _owner_rep_name_re():
+    """Word-boundary regex over every known rep name (default roster + reps
+    table) — the safety net that scrubs names embedded in free-text values
+    (e.g. "Ikshit visit on 2026-07-16" -> "Rep visit on 2026-07-16").
+    Built lazily (REP_ROSTER_DEFAULT is defined later in the module) and
+    rebuilt every 5 minutes so newly added reps are covered too."""
+    global _owner_name_re_cache
+    now = datetime.utcnow().timestamp()
+    if _owner_name_re_cache is not None and _owner_name_re_cache[1] > now:
+        return _owner_name_re_cache[0]
+    names = set(REP_ROSTER_DEFAULT)
+    try:
+        for r in db_fetchall("SELECT name FROM reps"):
+            n = (row_to_dict(r).get('name') or '').strip()
+            if len(n) >= 2:
+                names.add(n)
+    except Exception:
+        pass  # no request context / table missing — roster alone still covers
+    pattern = re.compile(
+        r'\b(' + '|'.join(re.escape(n) for n in sorted(names, key=len, reverse=True)) + r')\b')
+    _owner_name_re_cache = (pattern, now + 300)
+    return pattern
+
+
+def _owner_view() -> bool:
+    """True when this request asked for the owner-limited view."""
+    return ((request.args.get('view') or '').strip().lower() == 'owner'
+            or (request.headers.get('X-View') or '').strip().lower() == 'owner')
+
+
+def _owner_sanitize(obj):
+    """Deep-copy sanitize a JSON-shaped object for the owner view."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            lk = str(k).lower()
+            if lk in OWNER_STRIP_KEYS:
+                out[k] = ''
+            elif lk in OWNER_REP_KEYS:
+                if not v or str(v).strip().lower() in _OWNER_NEUTRAL_ACTORS:
+                    out[k] = v
+                else:
+                    out[k] = 'Rep'
+            else:
+                out[k] = _owner_sanitize(v)
+        return out
+    if isinstance(obj, list):
+        return [_owner_sanitize(x) for x in obj]
+    if isinstance(obj, str) and obj:
+        return _owner_rep_name_re().sub('Rep', obj)
+    return obj
+
+
+def owner_scope(fn):
+    """Decorator: sanitize the JSON response when the request is in owner view.
+
+    Placed ABOVE @cached_response so the cache stores the full internal
+    payload once and owner requests get the scrubbed copy on the way out —
+    the cache key never needs to know about the view, and a cached internal
+    body can never leak to the owner (or vice versa)."""
+    from functools import wraps
+
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        if not _owner_view():
+            return result
+        resp = result[0] if isinstance(result, tuple) else result
+        code = result[1] if (isinstance(result, tuple) and len(result) > 1) else None
+        try:
+            data = json.loads(resp.get_data(as_text=True))
+        except Exception:
+            return result
+        clean = jsonify(_owner_sanitize(data))
+        clean.status_code = code if code is not None else getattr(resp, 'status_code', 200)
+        clean.headers['X-View'] = 'owner'
+        return clean
+    return wrapped
+
+
 @app.after_request
 def _security_headers(resp):
     resp.headers['Strict-Transport-Security'] = 'max-age=63072000; includeSubDomains; preload'
@@ -347,31 +456,21 @@ def _security_headers(resp):
 
 
 DB_DIR = os.environ.get('DB_DIR', BASE_DIR)
-DB_PATH = os.path.join(DB_DIR, 'lcbo_tracker.db')
+DB_PATH = os.path.join(DB_DIR, 'drippcan.db')
 
 # Rep home base for route planning
 REP_HOME = {'lat': 43.6558, 'lng': -79.3628, 'address': '181 Dundas St E, Toronto, ON'}
 
-# Our tracked products on LCBO.com — verified SKUs (April 2026)
-# Source: live LCBO.com pages + lcbo.dev GraphQL API introspection
+# Our tracked products on LCBO.com — verified SKUs (July 2026)
+# Source: live LCBO.com store-inventory pages, checked 2026-07-14
 TRACKED_PRODUCTS = [
-    # NB Distillers (Anu-owned brand)
-    ('NB Distillers', 'Red Admiral Vodka', '20187', 'https://www.lcbo.com/en/red-admiral-vodka-20187', '$29.75', 'Spirits'),
-    ('NB Distillers', 'Chak De Canadian Whisky', '22246', 'https://www.lcbo.com/en/chak-de-canadian-whisky-22246', '$34.95', 'Spirits'),
-    # Anu portfolio — Goenchi Feni (India)
-    ('Goenchi', 'Goenchi Cashew Feni', '46340', 'https://www.lcbo.com/en/goenchi-cashew-feni-46340', '$93.95', 'Spirits'),
-    ('Goenchi', 'Goenchi Coconut Feni', '46343', 'https://www.lcbo.com/en/goenchi-coconut-feni-46343', '$93.95', 'Spirits'),
-    # Fratelli wines (India)
-    ('Fratelli', 'Fratelli Classic Shiraz', '46282', 'https://www.lcbo.com/en/fratelli-classic-shiraz-46282', '$22.95', 'Wine'),
-    ('Fratelli', 'Fratelli Sauvignon Blanc', '46286', 'https://www.lcbo.com/en/fratelli-sauvignon-blanc-46286', '$24.95', 'Wine'),
-    ('Fratelli', 'Fratelli Chenin Blanc', '46285', 'https://www.lcbo.com/en/fratelli-chenin-blanc-46285', '$25.95', 'Wine'),
-    ('Fratelli', 'Fratelli Cabernet Sauvignon', '46287', 'https://www.lcbo.com/en/fratelli-cabernet-sauvignon-46287', '$28.95', 'Wine'),
-    # Rutland Square (Scotland) — pending LCBO listing
-    ('Rutland Square', 'Rutland Square Chai Spiced Gin', '', 'https://rutlandsquare.com/products/chai-spiced-scottish-gin', '', 'Spirits'),
+    # Dripp Cann Spirits — the two live LCBO SKUs
+    ('Phoenix', 'Phoenix Ultra Smooth Vodka', '14318', 'https://www.lcbo.com/en/storeinventory/?sku=14318', '$31.15', 'Spirits'),
+    ('Dayaa', 'Dayaa Arak', '44451', 'https://www.lcbo.com/en/storeinventory/?sku=44451', '$29.85', 'Spirits'),
 ]
 
 # Brand-level grouping for gap/opportunity reports
-ANU_BRANDS = {'NB Distillers', 'Goenchi', 'Fratelli', 'Rutland Square', 'Anu Portfolio'}
+ANU_BRANDS = {'Phoenix', 'Dayaa', 'Dripp'}
 
 # Ontario city coordinates for route planning
 CITY_COORDS = {
@@ -742,7 +841,7 @@ def init_db():
         except Exception as _idx_err:
             print(f"[init_db] uniq_sod_listing_changes index skipped (dedupe needed): {_idx_err}")
         # Per-(store, sku) change tracking for our tracked SKUs:
-        # answers "which stores added/dropped Red Admiral last week?"
+        # answers "which stores added/dropped Phoenix last week?"
         cur.execute('''
             CREATE TABLE IF NOT EXISTS sod_store_sku_changes (
                 id BIGSERIAL PRIMARY KEY,
@@ -980,6 +1079,120 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_event_log_at ON event_log(created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_activities_visit_date ON activities(visit_date)",
             "CREATE INDEX IF NOT EXISTS idx_activities_deleted_at ON activities(deleted_at)",
+        ]:
+            try:
+                cur.execute(idx)
+            except Exception:
+                pass
+
+        # ======== Dripp: territory + live lcbo.com engine tables ========
+        # territory_stores — the 189-store book (73 routed + wider GTA) plus
+        # anything discovery adds later. Rows are NEVER deleted; `active`
+        # flips instead. owner_status/priority_rank changes are audited in
+        # territory_status_history (fix-any-mistake guarantee).
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS territory_stores (
+                id SERIAL PRIMARY KEY,
+                store_number INTEGER UNIQUE NOT NULL,
+                tier TEXT NOT NULL DEFAULT 'territory',
+                class TEXT DEFAULT '',
+                account TEXT DEFAULT '',
+                address TEXT DEFAULT '',
+                city TEXT DEFAULT '',
+                postal TEXT DEFAULT '',
+                route_day INTEGER,
+                route_stop INTEGER,
+                priority_rank INTEGER,
+                owner_status TEXT DEFAULT 'none',
+                owner_status_note TEXT DEFAULT '',
+                owner_status_updated_at TIMESTAMP,
+                added_at TIMESTAMP DEFAULT NOW(),
+                source TEXT DEFAULT 'seed',
+                active BOOLEAN DEFAULT TRUE
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS territory_status_history (
+                id BIGSERIAL PRIMARY KEY,
+                store_number INTEGER NOT NULL,
+                field TEXT NOT NULL,
+                old_value TEXT DEFAULT '',
+                new_value TEXT DEFAULT '',
+                changed_by TEXT DEFAULT '',
+                changed_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        # lcbo_live_snapshots — APPEND-ONLY per-store rows from the lcbo.com
+        # storeinventory scrape. Never updated, never deleted.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS lcbo_live_snapshots (
+                id BIGSERIAL PRIMARY KEY,
+                sku TEXT NOT NULL,
+                store_number INTEGER NOT NULL,
+                qty INTEGER DEFAULT 0,
+                store_name TEXT DEFAULT '',
+                city TEXT DEFAULT '',
+                checked_at TIMESTAMP DEFAULT NOW(),
+                batch_id TEXT NOT NULL
+            )
+        ''')
+        # lcbo_live_batches — one row per scrape batch (2 SKUs). Failures are
+        # recorded HERE with the error text; prior snapshots are never touched.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS lcbo_live_batches (
+                id BIGSERIAL PRIMARY KEY,
+                batch_id TEXT UNIQUE NOT NULL,
+                started_at TIMESTAMP DEFAULT NOW(),
+                finished_at TIMESTAMP,
+                triggered_by TEXT DEFAULT 'scheduler',
+                skus TEXT DEFAULT '',
+                row_count INTEGER DEFAULT 0,
+                store_count INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'running',
+                error TEXT DEFAULT ''
+            )
+        ''')
+        # live_listing_events — APPEND-ONLY listing changes detected from
+        # live snapshots (store appears/disappears/restocks on lcbo.com
+        # between batches) so we don't wait a day for SOD.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS live_listing_events (
+                id BIGSERIAL PRIMARY KEY,
+                sku TEXT NOT NULL,
+                store_number INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                old_qty INTEGER,
+                new_qty INTEGER,
+                batch_id TEXT DEFAULT '',
+                prev_batch_id TEXT DEFAULT '',
+                event_date DATE,
+                detected_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(sku, store_number, event_type, batch_id)
+            )
+        ''')
+        # rep_listing_observations — previously lazy-created by the observe
+        # endpoint; created here too so /api/reconcile can read it on a
+        # fresh database without a guard.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS rep_listing_observations (
+                id BIGSERIAL PRIMARY KEY,
+                sku TEXT NOT NULL,
+                store_number INTEGER NOT NULL,
+                rep TEXT NOT NULL,
+                on_shelf BOOLEAN DEFAULT TRUE,
+                units INTEGER,
+                notes TEXT,
+                observed_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        for idx in [
+            "CREATE INDEX IF NOT EXISTS idx_territory_tier ON territory_stores(tier)",
+            "CREATE INDEX IF NOT EXISTS idx_territory_city ON territory_stores(city)",
+            "CREATE INDEX IF NOT EXISTS idx_tsh_store ON territory_status_history(store_number, changed_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_live_snap ON lcbo_live_snapshots(sku, store_number, checked_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_live_snap_batch ON lcbo_live_snapshots(batch_id)",
+            "CREATE INDEX IF NOT EXISTS idx_live_events_date ON live_listing_events(event_date)",
+            "CREATE INDEX IF NOT EXISTS idx_rep_obs_sku_store ON rep_listing_observations(sku, store_number, observed_at DESC)",
         ]:
             try:
                 cur.execute(idx)
@@ -1306,6 +1519,15 @@ def init_db():
             ('activities', 'visit_date', "TEXT"),
             ('activities', 'deleted_at', "TIMESTAMP"),
             ('activities', 'updated_at', "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            # Parity with the PostgreSQL branch (additive only, both branches
+            # must stay in sync): GPS capture detail, store profile fields,
+            # multi-portfolio scaffold.
+            ('activities', 'accuracy_m', "REAL"),
+            ('activities', 'client_ts', "TIMESTAMP"),
+            ('activities', 'distance_from_store_m', "REAL"),
+            ('stores', 'spirits_ambassador', "TEXT DEFAULT ''"),
+            ('stores', 'store_notes', "TEXT DEFAULT ''"),
+            ('products', 'portfolio', "TEXT DEFAULT 'Anu'"),
         ]
         for table, col, coltype in migrate_cols:
             try:
@@ -1337,6 +1559,90 @@ def init_db():
                 db.execute(idx)
             except Exception:
                 pass
+        # ======== Dripp: territory + live lcbo.com engine tables ========
+        # Mirror of the PostgreSQL branch above — keep the two in sync.
+        db.executescript('''
+            CREATE TABLE IF NOT EXISTS territory_stores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_number INTEGER UNIQUE NOT NULL,
+                tier TEXT NOT NULL DEFAULT 'territory',
+                class TEXT DEFAULT '',
+                account TEXT DEFAULT '',
+                address TEXT DEFAULT '',
+                city TEXT DEFAULT '',
+                postal TEXT DEFAULT '',
+                route_day INTEGER,
+                route_stop INTEGER,
+                priority_rank INTEGER,
+                owner_status TEXT DEFAULT 'none',
+                owner_status_note TEXT DEFAULT '',
+                owner_status_updated_at TIMESTAMP,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                source TEXT DEFAULT 'seed',
+                active BOOLEAN DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS territory_status_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_number INTEGER NOT NULL,
+                field TEXT NOT NULL,
+                old_value TEXT DEFAULT '',
+                new_value TEXT DEFAULT '',
+                changed_by TEXT DEFAULT '',
+                changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS lcbo_live_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sku TEXT NOT NULL,
+                store_number INTEGER NOT NULL,
+                qty INTEGER DEFAULT 0,
+                store_name TEXT DEFAULT '',
+                city TEXT DEFAULT '',
+                checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                batch_id TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS lcbo_live_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT UNIQUE NOT NULL,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                finished_at TIMESTAMP,
+                triggered_by TEXT DEFAULT 'scheduler',
+                skus TEXT DEFAULT '',
+                row_count INTEGER DEFAULT 0,
+                store_count INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'running',
+                error TEXT DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS live_listing_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sku TEXT NOT NULL,
+                store_number INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                old_qty INTEGER,
+                new_qty INTEGER,
+                batch_id TEXT DEFAULT '',
+                prev_batch_id TEXT DEFAULT '',
+                event_date TEXT,
+                detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(sku, store_number, event_type, batch_id)
+            );
+            CREATE TABLE IF NOT EXISTS rep_listing_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sku TEXT NOT NULL,
+                store_number INTEGER NOT NULL,
+                rep TEXT NOT NULL,
+                on_shelf BOOLEAN DEFAULT 1,
+                units INTEGER,
+                notes TEXT,
+                observed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_territory_tier ON territory_stores(tier);
+            CREATE INDEX IF NOT EXISTS idx_territory_city ON territory_stores(city);
+            CREATE INDEX IF NOT EXISTS idx_tsh_store ON territory_status_history(store_number, changed_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_live_snap ON lcbo_live_snapshots(sku, store_number, checked_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_live_snap_batch ON lcbo_live_snapshots(batch_id);
+            CREATE INDEX IF NOT EXISTS idx_live_events_date ON live_listing_events(event_date);
+            CREATE INDEX IF NOT EXISTS idx_rep_obs_sku_store ON rep_listing_observations(sku, store_number, observed_at DESC);
+        ''')
         db.commit()
         db.close()
 
@@ -1494,6 +1800,14 @@ def api_store_detail(store_id):
     return jsonify(dict(store))
 
 
+# Contact-card fields whose edits are audited to territory_status_history
+# (fix-any-mistake guarantee: every save records old -> new, who, when).
+CONTACT_AUDIT_FIELDS = (
+    'manager_name', 'asst_manager_name', 'manager_phone', 'store_email',
+    'spirits_ambassador', 'contacts', 'phone', 'email', 'store_notes',
+)
+
+
 @app.route('/api/stores/<int:store_id>', methods=['PUT'])
 @require_app_origin
 def api_store_update(store_id):
@@ -1502,6 +1816,10 @@ def api_store_update(store_id):
               'priority', 'status', 'rep', 'manager_name', 'asst_manager_name',
               'manager_phone', 'store_email', 'producer',
               'spirits_ambassador', 'store_notes']
+    old = db_fetchone("SELECT * FROM stores WHERE id=?", [store_id])
+    if not old:
+        return jsonify({'error': 'Not found'}), 404
+    old = row_to_dict(old)
     sets, params = [], []
     for f in fields:
         if f in data:
@@ -1511,8 +1829,23 @@ def api_store_update(store_id):
         return jsonify({'error': 'No fields'}), 400
     params.append(store_id)
     db_execute(f"UPDATE stores SET {','.join(sets)} WHERE id=?", params)
+    # Audit every contact-card change (old -> new, who, when) so the store
+    # page can show "last updated by X on date" and any mistake is fixable.
+    changed_by = (str(data.get('updated_by') or '').strip() or 'rep')
+    audited = 0
+    for f in CONTACT_AUDIT_FIELDS:
+        if f not in data:
+            continue
+        old_v = '' if old.get(f) is None else str(old.get(f))
+        new_v = '' if data[f] is None else str(data[f])
+        if old_v != new_v:
+            _territory_audit(old['store_number'], f'contact:{f}', old_v, new_v, changed_by)
+            audited += 1
     db_commit()
-    return jsonify({'success': True})
+    if audited:
+        _log_event('store_contacts_updated', 'store', old['store_number'],
+                   changed_by, {'fields_audited': audited})
+    return jsonify({'success': True, 'audited_fields': audited})
 
 
 @app.route('/api/stores/<int:store_id>/snapshot')
@@ -1953,7 +2286,7 @@ def scrape_lcbo_inventory(sku):
 
 def fetch_lcbo_graphql_inventory(sku):
     """Fetch live inventory + metadata from LCBO.dev GraphQL — used for price/listing-status enrichment.
-    Does NOT cover all SKUs (e.g. 20187 Red Admiral is missing) so always combine with scrape_lcbo_inventory."""
+    Does NOT cover all SKUs (coverage varies) so always combine with scrape_lcbo_inventory."""
     if not http_requests or not sku:
         return None, 'no http/sku'
     try:
@@ -2675,7 +3008,7 @@ def api_geocode_stores():
             resp = http_requests.get(
                 'https://nominatim.openstreetmap.org/search',
                 params={'q': addr, 'format': 'json', 'limit': 1},
-                headers={'User-Agent': 'LCBOTracker/1.0 (anu-spirits-crm)'},
+                headers={'User-Agent': 'DrippTracker/1.0 (drippcan-crm)'},
                 timeout=10
             )
             if resp.status_code == 200 and resp.json():
@@ -2701,12 +3034,12 @@ def api_geocode_stores():
 
 @app.route('/api/opportunities/nb-distillers')
 def api_nb_opportunities():
-    """Show stores with 0 or 1 NB Distillers products stocked — key sales opportunities"""
-    # Get inventory cache for NB products (Red Admiral 20187, Chak De 22246)
-    nb_products = db_fetchall("SELECT id, name, lcbo_sku FROM products WHERE brand='NB Distillers'")
+    """Show stores with 0 or 1 Dripp products stocked — key sales opportunities"""
+    # Get inventory cache for Dripp products (Phoenix 14318, Dayaa 44451)
+    nb_products = db_fetchall("SELECT id, name, lcbo_sku FROM products WHERE brand IN ('Phoenix','Dayaa')")
     nb_product_ids = [p['id'] for p in nb_products]
 
-    # Get stores with their NB Distillers stock counts
+    # Get stores with their Dripp stock counts
     stores = db_fetchall("""
         SELECT s.id, s.store_number, s.account, s.city, s.address, s.postal,
                s.manager_name, s.phone, s.priority, s.lat, s.lng,
@@ -2716,7 +3049,7 @@ def api_nb_opportunities():
                MAX(a.created_at) as last_visit
         FROM stores s
         LEFT JOIN inventory_cache ic ON s.store_number = CAST(ic.store_number AS INTEGER)
-            AND ic.product_id IN (SELECT id FROM products WHERE brand='NB Distillers')
+            AND ic.product_id IN (SELECT id FROM products WHERE brand IN ('Phoenix','Dayaa'))
             AND ic.quantity > 0
         LEFT JOIN activities a ON s.id = a.store_id
         GROUP BY s.id
@@ -2937,71 +3270,48 @@ SOD_AGENT_ID = os.environ.get('SOD_AGENT_ID', '1113').strip()  # default: VINETE
 
 # ------- SKU → brand mapping -------
 # Keys are 7-char zero-padded SKUs (matches what SOD emits).
-# NB Distillers is the PRIMARY paying client. Goenchi + Fratelli are
-# Anu's secondary import portfolio — tracked separately in /anu-import.
+# Dripp Cann Spirits is the ONLY client of this tracker — both SKUs are
+# primary everywhere. Verified live on lcbo.com 2026-07-14.
 SOD_TRACKED_SKUS = {
-    # NB Distillers (PRIMARY paying client — reps are NB-focused for now)
-    '0020187': ('NB Distillers', 'Red Admiral Vodka'),
-    '0022246': ('NB Distillers', 'Chak De Canadian Whisky'),
-    # Anu Import portfolio (separate agency book — toggle to view)
-    '0046340': ('Goenchi', 'Goenchi Cashew Feni'),
-    '0046343': ('Goenchi', 'Goenchi Coconut Feni'),
-    '0046282': ('Fratelli', 'Fratelli Classic Shiraz'),
-    '0046285': ('Fratelli', 'Fratelli Chenin Blanc'),
-    '0046286': ('Fratelli', 'Fratelli Sauvignon Blanc'),
-    '0046287': ('Fratelli', 'Fratelli Cabernet Sauvignon'),
-    '0045378': ('Rock Paper', 'Rock Paper Rum'),  # NEW Anu import — added 2026-05-27
-    # Prospect analysis for the agency pitch — Mandakini (Oxford Beverage Group).
-    # Added 2026-07-04 so SOD carries store-level rows for #47587 (listed vs stocked).
-    '0047587': ('Mandakini', 'Mandakini Malabari Vaatte Desi Daaru'),
+    '0014318': ('Phoenix', 'Phoenix Ultra Smooth Vodka'),  # $31.15/750mL
+    '0044451': ('Dayaa', 'Dayaa Arak'),                    # $29.85/750mL
 }
 
-# Portfolio split — every tracked SKU belongs to exactly one agency book.
-# Used to scope rep dashboards / territory rollups / morning digest etc.
-# Default behavior on rep-facing surfaces is portfolio='NB' so the field
-# team's view stays clean; Anu data is one toggle away.
+# Portfolio split — single book. Both SKUs belong to the one Dripp portfolio;
+# any portfolio toggle in the UI resolves to the full tracked set.
 SKU_PORTFOLIO = {
-    '0020187': 'NB',  '0022246': 'NB',
-    '0046340': 'Anu', '0046343': 'Anu',
-    '0046282': 'Anu', '0046285': 'Anu',
-    '0046286': 'Anu', '0046287': 'Anu',
-    '0045378': 'Anu',
-    '0047587': 'Anu',  # Mandakini prospect
+    '0014318': 'Dripp',
+    '0044451': 'Dripp',
 }
 
 
 def _skus_for_portfolio(portfolio: str | None) -> list[str]:
-    """Return tracked SKU codes that belong to the requested portfolio.
+    """Return tracked SKU codes for the requested portfolio.
 
-    portfolio:
-      'NB'  → only NB Distillers SKUs (Red Admiral + Chak De)  ← rep default
-      'Anu' → only Anu Import SKUs (Goenchi/Fratelli/Rock Paper)
-      'all' / None / '' → every tracked SKU (operator view)
+    Dripp Tracker runs a single portfolio — every portfolio value
+    ('Dripp' / 'all' / None / legacy toggles) returns ALL tracked SKUs.
     """
-    if not portfolio or str(portfolio).strip().lower() == 'all':
-        return list(SOD_TRACKED_SKUS.keys())
-    want = str(portfolio).strip().upper()
-    if want == 'ANU': want = 'Anu'  # canonical case
-    return [s for s, p in SKU_PORTFOLIO.items() if p == want]
+    return list(SOD_TRACKED_SKUS.keys())
 
-# Client classification — drives whether a SKU appears in NB-primary views vs the
-# /anu-import secondary section.
-SOD_PRIMARY_BRAND = 'NB Distillers'
-SOD_ANU_IMPORT_BRANDS = {'Goenchi', 'Fratelli'}
+# Client classification — neutralized: both Dripp SKUs are primary everywhere.
+# Kept only so legacy code paths keep working without branching.
+SOD_PRIMARY_BRAND = 'Dripp'
+SOD_ANU_IMPORT_BRANDS: set = set()
 
 
 def sku_client_class(sku):
-    """Return 'nb_primary' for NB Distillers SKUs, 'anu_import' for the rest."""
-    brand, _ = SOD_TRACKED_SKUS.get(sku, ('', ''))
-    return 'nb_primary' if brand == SOD_PRIMARY_BRAND else 'anu_import'
+    """Every tracked SKU is primary in Dripp Tracker (no secondary book)."""
+    return 'nb_primary'
 
 
 def primary_skus():
-    return [s for s, (b, _) in SOD_TRACKED_SKUS.items() if b == SOD_PRIMARY_BRAND]
+    return list(SOD_TRACKED_SKUS.keys())
 
 
 def anu_import_skus():
-    return [s for s, (b, _) in SOD_TRACKED_SKUS.items() if b in SOD_ANU_IMPORT_BRANDS]
+    # Neutralized: no secondary import book — resolves to the full tracked set
+    # so any legacy brand/portfolio filter still returns both Dripp SKUs.
+    return list(SOD_TRACKED_SKUS.keys())
 
 _SOD_CSRF_RE = re.compile(
     r'<input[^>]*name="csrf_token"[^>]*value="([^"]+)"', re.IGNORECASE
@@ -3828,7 +4138,7 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
 
         print(f"[SOD-{source}] step 4/8 done: {len(change_inserts)} SKU-level changes")
         # 4b) PER-STORE per-SKU change detection for our tracked SKUs.
-        # Answers "which stores added Red Admiral last week" — the rep workflow.
+        # Answers "which stores added Phoenix last week" — the rep workflow.
         # Compare current snapshot per-(sku,store) status to the most-recent PRIOR
         # snapshot for that SKU. Insert into sod_store_sku_changes (idempotent via
         # UNIQUE constraint).
@@ -4431,7 +4741,7 @@ def api_sod_portfolios():
       default: 'NB' (the rep-facing default)
     """
     out = []
-    for pkey, plabel in [('NB', 'NB Distillers'), ('Anu', 'Anu Imports')]:
+    for pkey, plabel in [('Dripp', 'Dripp Cann Spirits')]:
         skus = []
         for sku, (brand, name) in SOD_TRACKED_SKUS.items():
             if SKU_PORTFOLIO.get(sku) == pkey:
@@ -4442,7 +4752,7 @@ def api_sod_portfolios():
             'sku_count': len(skus),
             'skus': skus,
         })
-    return jsonify({'portfolios': out, 'default': 'NB'})
+    return jsonify({'portfolios': out, 'default': 'Dripp'})
 
 
 @app.route('/api/sod/products', methods=['GET'])
@@ -5277,7 +5587,7 @@ def _daily_health_check(auto_recover=True):
     Checks:
       1. SOD snapshot freshness (age <= 2 days)
       2. Last successful sync per source
-      3. Tracked-SKU data integrity (each of our 8 SKUs has data in latest snapshot)
+      3. Tracked-SKU data integrity (each of our 2 tracked SKUs has data in latest snapshot)
       4. No stuck-running rows
       5. Per-store change tracking (sod_store_sku_changes has data)
       6. Brand endpoints return non-zero counts
@@ -5594,13 +5904,13 @@ def send_alert(subject: str, body: str, level: str = 'warning'):
     level: 'info' | 'warning' | 'critical' — colors / prefixes the subject.
     """
     prefix = {'info': '✓', 'warning': '⚠', 'critical': '🔴'}.get(level, '⚠')
-    full_subject = f"[Anu LCBO] {prefix} {subject}"
+    full_subject = f"[Dripp Tracker] {prefix} {subject}"
     print(f"[alert/{level}] {subject}")
 
     # ---- 1. Resend API (preferred — clean HTTP) ----
     resend_key = os.environ.get('RESEND_API_KEY', '').strip()
     to_addr = os.environ.get('ALERT_EMAIL_TO', '').strip()
-    from_addr = os.environ.get('ALERT_EMAIL_FROM', 'alerts@anu-lcbo.local').strip()
+    from_addr = os.environ.get('ALERT_EMAIL_FROM', 'alerts@drippcan.local').strip()
     if resend_key and to_addr and http_requests:
         try:
             r = http_requests.post(
@@ -6141,6 +6451,7 @@ def api_crm_store_set_territory(store_id):
 
 # ------- Brink-of-OOS detection -------
 @app.route('/api/crm/oos-risk', methods=['GET'])
+@owner_scope
 def api_crm_oos_risk():
     """Stores carrying a tracked SKU but on_hand is dangerously low.
 
@@ -7329,7 +7640,7 @@ def api_admin_export_everything():
 
         # README explaining the bundle
         readme_lines = [
-            "# Anu LCBO Tracker — Data Export",
+            "# Dripp Tracker — Data Export",
             "",
             f"Generated: {manifest['generated_at']}",
             f"Time window: last {days} days (for time-filtered tables)",
@@ -7409,7 +7720,7 @@ def api_admin_rep_behavior():
     cur = db.cursor() if USE_POSTGRES else db
 
     # Get full rep roster (same hard-coded list as frontend)
-    rep_roster = ['Ikshit', 'Namit', 'Virat', 'Surya', 'Neeraj']
+    rep_roster = ['Ikshit', 'Vaneet', 'Ed', 'Namit']
     out_rows = []
 
     for rep in rep_roster:
@@ -7855,7 +8166,7 @@ def api_admin_rep_activity_report():
             "daily_rollup is the bar-chart series. "
             "Add &format=csv to download the full row-level log "
             "(up to 50,000 rows) — designed for Excel pivots and "
-            "submission to NB Distillers / brand owners."
+            "submission to Dripp Cann Spirits / brand owners."
         ),
     })
 
@@ -8239,7 +8550,7 @@ def api_admin_data_integrity():
 def api_admin_commission_audit():
     """Per-store-SKU reconciliation report — every disagreement between
     SOD's listing status and what lcbo.com / rep observations actually
-    show. This is the artifact you take to NB Distillers / brand owners
+    show. This is the artifact you take to Dripp Cann Spirits / brand owners
     when contesting commission shortfalls.
 
     Query params:
@@ -8446,7 +8757,7 @@ def api_admin_commission_audit():
     })
 
 
-# Manual rep override — "I physically saw Red Admiral on shelf at this store"
+# Manual rep override — "I physically saw Phoenix on shelf at this store"
 # This is the field-data flow that catches SOD undercounts the moment a rep
 # notices them, instead of waiting for the next lcbo.com scrape.
 @app.route('/api/crm/observe-listing', methods=['POST'])
@@ -9355,7 +9666,7 @@ def api_admin_new_listings_by_range():
     fmt = (request.args.get('format') or 'json').lower()
     if fmt == 'csv':
         # Flat CSV: one row per (sku, store) added or lost. Designed for
-        # direct import into Excel / submission to NB Distillers.
+        # direct import into Excel / submission to Dripp Cann Spirits.
         import csv as _csv, io as _io
         buf = _io.StringIO()
         w = _csv.writer(buf)
@@ -9520,7 +9831,7 @@ def api_admin_sod_compare_uploads():
     if not from_dates:
         return jsonify({
             'error': 'no rows for tracked SKUs found in from_zip',
-            'tip': 'ZIP may not contain any of our 8 tracked SKUs.',
+            'tip': 'ZIP may not contain any of our 2 tracked SKUs.',
         }), 422
     # Pick which date inside from_zip to use as the snapshot
     if from_date_pick and from_date_pick in from_parsed['listed_by_date_sku']:
@@ -11029,7 +11340,7 @@ def api_admin_movement():
     # The truth = master `stores` ∪ latest SOD snapshot ∪ recent lcbo.com.
     # Each source is incomplete on its own:
     #   - master directory: hand-maintained, can be stale
-    #   - SOD: filtered to our 8 tracked SKUs at ingest
+    #   - SOD: filtered to our 2 tracked SKUs at ingest
     #   - lcbo.com: 30-min scrape, sometimes misses stores/products
     # Plus: which stores actually CARRY any of our SKUs is also a union.
     try:
@@ -11566,7 +11877,7 @@ def _render_morning_digest_html(digest: dict) -> str:
         gen_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
     body = f'''
     <div style="font-family:Arial,sans-serif;max-width:800px;margin:0 auto;color:#2a1f0f">
-      <h1 style="color:#d4a574;margin:0 0 4px">Anu Spirits — Morning Digest</h1>
+      <h1 style="color:#d4a574;margin:0 0 4px">Dripp Tracker — Morning Digest</h1>
       <p style="color:#666;margin:0 0 16px;font-size:13px">
         Snapshot {snap} · threshold &lt; {thr} bottles · generated {gen_str}
       </p>
@@ -11588,8 +11899,8 @@ def _render_morning_digest_html(digest: dict) -> str:
       <hr style="border:none;border-top:1px solid #efe1c3;margin:24px 0 10px">
       <p style="color:#888;font-size:12px;margin:0">
         Full dashboard:
-        <a href="https://lcbo-tracker-web.vercel.app/" style="color:#d4a574">lcbo-tracker-web.vercel.app</a>
-        · Daily SOD ingest · Anu Spirits Tracker
+        <a href="https://drippcan-web.vercel.app/" style="color:#d4a574">drippcan-web.vercel.app</a>
+        · Daily SOD ingest · Dripp Tracker
       </p>
     </div>
     '''
@@ -11904,7 +12215,7 @@ def _send_backup_email(payload: dict):
     """
     resend_key = os.environ.get('RESEND_API_KEY', '').strip()
     to_addr = os.environ.get('ALERT_EMAIL_TO', '').strip()
-    from_addr = os.environ.get('ALERT_EMAIL_FROM', 'alerts@anu-lcbo.local').strip()
+    from_addr = os.environ.get('ALERT_EMAIL_FROM', 'alerts@drippcan.local').strip()
     if not (resend_key and to_addr and http_requests):
         print("[backup] skipped — RESEND_API_KEY or ALERT_EMAIL_TO not configured")
         return False
@@ -11913,7 +12224,7 @@ def _send_backup_email(payload: dict):
     b64 = base64.b64encode(body_json.encode('utf-8')).decode('ascii')
     today = datetime.utcnow().strftime('%Y-%m-%d')
     total_rows = sum(t.get('row_count', 0) for t in payload.get('tables', {}).values() if isinstance(t, dict))
-    summary_lines = ['Daily backup — Anu LCBO Tracker', f"Date: {today}",
+    summary_lines = ['Daily backup — Dripp Tracker', f"Date: {today}",
                      f"Total rows: {total_rows}", '', 'Per-table row counts:']
     for tname, td in sorted(payload.get('tables', {}).items()):
         if isinstance(td, dict):
@@ -11934,10 +12245,10 @@ def _send_backup_email(payload: dict):
             json={
                 'from': from_addr,
                 'to': [a.strip() for a in to_addr.split(',') if a.strip()],
-                'subject': f'[Anu LCBO] Daily backup — {today} — {total_rows} rows',
+                'subject': f'[Dripp Tracker] Daily backup — {today} — {total_rows} rows',
                 'text': '\n'.join(summary_lines),
                 'attachments': [{
-                    'filename': f'anu-lcbo-backup-{today}.json',
+                    'filename': f'drippcan-backup-{today}.json',
                     'content': b64,
                 }],
             },
@@ -12228,7 +12539,7 @@ def api_crm_calendar_ics(rep_name):
     lines = [
         'BEGIN:VCALENDAR',
         'VERSION:2.0',
-        'PRODID:-//Anu Spirits//LCBO Tracker//EN',
+        'PRODID:-//Dripp Cann Spirits//Dripp Tracker//EN',
         'CALSCALE:GREGORIAN',
         f'X-WR-CALNAME:Anu Tastings — {rep_name}',
         'X-WR-TIMEZONE:America/Toronto',
@@ -12250,7 +12561,7 @@ def api_crm_calendar_ics(rep_name):
         loc = f"{address}, {city}".strip(', ').replace(',', '\\,').replace(';', '\\;')
         lines += [
             'BEGIN:VEVENT',
-            f'UID:tasting-{d_id}@anu-lcbo',
+            f'UID:tasting-{d_id}@drippcan',
             f'DTSTAMP:{datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")}',
             f'DTSTART;VALUE=DATE:{date_str}',
             f'DTEND;VALUE=DATE:{date_str}',
@@ -12307,7 +12618,7 @@ def _send_tasting_digest_email(when='tomorrow'):
         or os.environ.get('ALERT_EMAIL_TO', '').strip()
     )
     resend_key = os.environ.get('RESEND_API_KEY', '').strip()
-    from_addr = os.environ.get('ALERT_EMAIL_FROM', 'alerts@anu-lcbo.local').strip()
+    from_addr = os.environ.get('ALERT_EMAIL_FROM', 'alerts@drippcan.local').strip()
 
     if not (resend_key and to_addr and http_requests):
         print("[tasting-digest] skipped — RESEND_API_KEY or TASTING_DIGEST_TO not configured")
@@ -12316,7 +12627,7 @@ def _send_tasting_digest_email(when='tomorrow'):
     if not rows:
         # Still send a "no tastings" email so user knows the digest is alive.
         body_text = f"No tastings booked for {when_label} ({target_date}).\n\nUse /api/crm/tasting-booking to book new tastings."
-        subject = f"[Anu LCBO] {when_label}'s tastings — none booked ({target_date})"
+        subject = f"[Dripp Tracker] {when_label}'s tastings — none booked ({target_date})"
     else:
         # Group by rep
         by_rep = {}
@@ -12343,7 +12654,7 @@ def _send_tasting_digest_email(when='tomorrow'):
                 lines.append('')
             lines.append('')
         body_text = '\n'.join(lines)
-        subject = f"[Anu LCBO] {when_label}'s tastings — {len(rows)} booked ({target_date})"
+        subject = f"[Dripp Tracker] {when_label}'s tastings — {len(rows)} booked ({target_date})"
 
     try:
         r = http_requests.post(
@@ -13494,27 +13805,27 @@ def api_crm_distribution_additions():
 @app.route('/api/crm/nb-tracker', methods=['GET'])
 @cached_response(ttl_seconds=120, key_args=())
 def api_crm_nb_tracker():
-    """Dedicated NB Distillers tracker — premium client view.
+    """Dedicated Dripp Cann Spirits tracker — premium client view.
 
-    NB Distillers is the paying client. This endpoint is shaped specifically for
-    their executive view — Red Admiral Vodka (SKU 20187) + Chak De Canadian
-    Whisky (SKU 22246) combined, with everything they care about in one payload.
+    Dripp Cann Spirits is the paying client. This endpoint is shaped for the
+    executive view — Phoenix Ultra Smooth Vodka (SKU 14318) + Dayaa Arak
+    (SKU 44451) combined, with everything they care about in one payload.
 
     Returns:
       - per_sku: rollup with listed/delisting/fully_delisted/on_hand
       - velocity: week-rate per SKU, days-to-OOS for stores at risk
-      - top_stores: stores carrying NB products by on-hand
-      - additions_60d: every store that added an NB SKU in last 60 days
-      - delistings_60d: every store where an NB SKU got delisted
+      - top_stores: stores carrying Dripp products by on-hand
+      - additions_60d: every store that added a Dripp SKU in last 60 days
+      - delistings_60d: every store where a Dripp SKU got delisted
       - oos_risk: stores listed but on_hand <= 2
-      - tasting_followups: stores where tasting happened, NB SKU not currently listed
-      - lcbo_live_discoveries: stores where lcbo.com shows NB live but SOD shows blank/F
-      - territory_coverage: NB store count per territory
+      - tasting_followups: stores where tasting happened, Dripp SKU not currently listed
+      - lcbo_live_discoveries: stores where lcbo.com shows Dripp live but SOD shows blank/F
+      - territory_coverage: Dripp store count per territory
       - 30-day trend series for the dashboard chart
     """
-    NB_SKUS = [s for s, (b, _) in SOD_TRACKED_SKUS.items() if b == 'NB Distillers']
+    NB_SKUS = list(SOD_TRACKED_SKUS.keys())
     if not NB_SKUS:
-        return jsonify({'error': 'No NB Distillers SKUs configured'}), 500
+        return jsonify({'error': 'No Dripp SKUs configured'}), 500
 
     db = get_db()
     ph = '%s' if USE_POSTGRES else '?'
@@ -13935,8 +14246,8 @@ def api_crm_nb_tracker():
     }
 
     return jsonify({
-        'brand': 'NB Distillers',
-        'tagline': 'Premium Anu Spirits client tracker',
+        'brand': 'Dripp Cann Spirits',
+        'tagline': 'Phoenix + Dayaa at LCBO',
         'skus': NB_SKUS,
         'per_sku': per_sku,
         'totals': totals,
@@ -13953,8 +14264,8 @@ def api_crm_nb_tracker():
 
 @app.route('/api/crm/brand/<brand>', methods=['GET'])
 def api_crm_brand(brand):
-    """Combined distribution health for one brand (e.g. 'NB Distillers' covers
-    Red Admiral + Chak De together).
+    """Combined distribution health for one brand (e.g. 'Phoenix' or 'Dayaa';
+    'Dripp' covers both together).
 
     Returns per-SKU rollup + combined-brand metrics + recent additions/losses
     (last 60 days) + per-store matrix (which stores carry which of our SKUs).
@@ -14237,7 +14548,7 @@ def api_crm_portfolio_trend():
     Powers the dashboard hero chart. Returns one row per date with:
       total_listed (sum of stores carrying any tracked SKU at status='L'),
       total_delisting, total_fully_delisted, total_on_hand,
-      tracked_skus_with_data (how many of our 8 SKUs had data that day).
+      tracked_skus_with_data (how many of our 2 tracked SKUs had data that day).
     """
     days = int(request.args.get('days', 30))
     since = (_toronto_today() - timedelta(days=days)).isoformat()
@@ -14450,7 +14761,7 @@ def api_crm_route_planner():
       city           — exact city match (e.g. 'Toronto')
       district       — territory name match (e.g. 'GTA West') — alternative to city
       max_skus_listed — stores with ≤ this many of our SKUs at status='L' (default 1)
-      brand          — 'NB Distillers' or 'Anu Import' to scope by brand
+      brand          — legacy brand scoping; every value resolves to both Dripp SKUs
       max_stops      — cap (default 10)
       start_lat, start_lng — optimize from this location
       include_no_lcbo — include stores not yet in our CRM (default false)
@@ -14472,7 +14783,7 @@ def api_crm_route_planner():
     # Determine which SKUs count toward "listed at this store"
     if brand_filter.lower().startswith('anu'):
         scoped_skus = anu_import_skus()
-    elif brand_filter == 'NB Distillers' or brand_filter.lower() == 'nb':
+    elif brand_filter.lower() in ('dripp', 'nb'):  # legacy toggle — same full set
         scoped_skus = primary_skus()
     else:
         scoped_skus = list(SOD_TRACKED_SKUS.keys())
@@ -14579,13 +14890,12 @@ def api_crm_route_planner():
 @app.route('/api/crm/anu-import', methods=['GET'])
 @cached_response(ttl_seconds=120, key_args=())
 def api_crm_anu_import():
-    """Anu Import portfolio tracker (Goenchi + Fratelli) — secondary to NB.
-
-    Same shape as /nb-tracker but scoped to Anu Import SKUs.
+    """Legacy portfolio tracker route — Dripp runs a single book, so this
+    resolves to the same two SKUs as /nb-tracker. Kept harmless.
     """
     skus = anu_import_skus()
     if not skus:
-        return jsonify({'brand': 'Anu Import', 'skus': [], 'totals': {}})
+        return jsonify({'brand': 'Dripp Cann Spirits', 'skus': [], 'totals': {}})
 
     db = get_db()
     ph = '%s' if USE_POSTGRES else '?'
@@ -14699,8 +15009,8 @@ def api_crm_anu_import():
     }
 
     return jsonify({
-        'brand': 'Anu Import',
-        'tagline': 'Goenchi + Fratelli — secondary import portfolio',
+        'brand': 'Dripp Cann Spirits',
+        'tagline': 'Phoenix + Dayaa — single Dripp portfolio',
         'skus': skus,
         'per_sku': per_sku,
         'totals': totals,
@@ -15150,35 +15460,20 @@ AI_MODEL = os.environ.get('ANTHROPIC_MODEL', 'claude-sonnet-4-5-20250929')
 # ===================================================================
 
 _SKU_ALIASES = {
-    # NB Distillers (priority)
-    'red admiral': '0020187',
-    'red admiral vodka': '0020187',
-    'admiral': '0020187',
-    'chak de': '0022246',
-    'chakde': '0022246',
-    'chak de whisky': '0022246',
-    'chak de canadian whisky': '0022246',
-    # Anu Import
-    'goenchi cashew': '0046340',
-    'cashew feni': '0046340',
-    'goenchi coconut': '0046343',
-    'coconut feni': '0046343',
-    'goenchi': '0046340',  # default to cashew
-    'feni': '0046340',
-    'fratelli shiraz': '0046282',
-    'classic shiraz': '0046282',
-    'shiraz': '0046282',
-    'fratelli chenin': '0046285',
-    'chenin': '0046285',
-    'fratelli sauv': '0046286',
-    'sauvignon blanc': '0046286',
-    'sauvignon': '0046286',
-    'fratelli cabernet': '0046287',
-    'cabernet': '0046287',
-    'cabernet sauvignon': '0046287',
+    # Dripp Cann Spirits — Phoenix Ultra Smooth Vodka
+    'phoenix': '0014318',
+    'phoenix vodka': '0014318',
+    'phoenix ultra smooth': '0014318',
+    'phoenix ultra smooth vodka': '0014318',
+    'ultra smooth': '0014318',
+    'vodka': '0014318',
+    # Dripp Cann Spirits — Dayaa Arak
+    'dayaa': '0044451',
+    'dayaa arak': '0044451',
+    'arak': '0044451',
 }
 
-_REP_NAMES = ['ikshit', 'namit', 'virat', 'surya', 'neeraj']
+_REP_NAMES = ['ikshit', 'vaneet', 'ed', 'namit']
 
 _CITY_ALIASES = [
     'toronto', 'ottawa', 'mississauga', 'brampton', 'hamilton',
@@ -15646,7 +15941,7 @@ def _count_total_stores():
     pct = round(carrying_total / universe_total * 100, 1) if universe_total else 0
     parts = [
         f"LCBO universe (union of master directory, SOD, and lcbo.com): {universe_total} stores.",
-        f"{carrying_total} carry at least one of our 8 SKUs ({pct}% coverage) as of {as_of}.",
+        f"{carrying_total} carry at least one of our 2 SKUs ({pct}% coverage) as of {as_of}.",
     ]
     if carrying_only_lcbo:
         parts.append(f"{carrying_only_lcbo} stores show our products only on lcbo.com (SOD missed) — potential commission claims.")
@@ -16052,7 +16347,7 @@ def _summarize_rep_behavior(days=30):
     going to the same places?'."""
     db = get_db()
     cur = db.cursor() if USE_POSTGRES else db
-    rep_roster = ['Ikshit', 'Namit', 'Virat', 'Surya', 'Neeraj']
+    rep_roster = ['Ikshit', 'Vaneet', 'Ed', 'Namit']
 
     flagged = []  # list of {rep, flags, key_metric}
     rows_for_table = []
@@ -16259,7 +16554,7 @@ def _free_answer(question):
         return _summarize_source_drift()
 
     # Priority 0b: new-listings-by-snapshot-diff — "how many new stores were
-    # ADDED for Red Admiral last 60 days" or "how many stores added this month".
+    # ADDED for Phoenix last 60 days" or "how many stores added this month".
     # Distinct from _count_new_listings (which counts NEW_LISTING events) —
     # this does a 2-snapshot diff that catches listings even if the diff
     # engine missed the event, plus cross-checks against lcbo.com.
@@ -16317,13 +16612,13 @@ def _free_answer(question):
 
 
 _FREE_ANSWER_HELP = (
-    "I can answer questions like: 'Summarize Red Admiral', 'How is Namit doing?', "
-    "'Summarize store 217', 'How many stores list Chak De in Toronto?', "
-    "'Top stores for Red Admiral', 'What's delisting?', 'Portfolio summary', "
+    "I can answer questions like: 'Summarize Phoenix', 'How is Namit doing?', "
+    "'Summarize store 217', 'How many stores list Dayaa in Toronto?', "
+    "'Top stores for Phoenix', 'What's delisting?', 'Portfolio summary', "
     "'How many LCBO stores are there?', 'New listings last 7 days', "
-    "'New stores added for Red Admiral last 60 days', "
+    "'New stores added for Phoenix last 60 days', "
     "'Any new stores added this month?', 'Where does SOD disagree with lcbo.com?', "
-    "'Source drift report', 'Any hidden listings?', 'Ghost listings for Red Admiral?'."
+    "'Source drift report', 'Any hidden listings?', 'Ghost listings for Phoenix?'."
 )
 
 
@@ -16410,7 +16705,7 @@ def api_ai_ask():
     """
 
     system_prompt = (
-        "You are a SQL analyst for the Anu Spirits LCBO CRM. The user asks a question; "
+        "You are a SQL analyst for the Dripp Tracker LCBO CRM. The user asks a question; "
         "you respond with EXACTLY one read-only SQL SELECT statement that answers it. "
         "Use Postgres syntax. Do NOT use INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE. "
         "Keep the result <= 50 rows (use LIMIT). Output ONLY the SQL — no commentary, "
@@ -16890,9 +17185,11 @@ def api_crm_replace_targets(store_number):
 
 
 @app.route('/api/crm/store/<int:store_number>/full', methods=['GET'])
+@owner_scope
 def api_crm_store_full(store_number):
-    """One-call store profile: store info + tracked SKU status + recent activities +
-    open deals + replace-targets summary. Powers the upgraded /stores/[id] page."""
+    """One-call store profile: store info + contacts last-updated-by + per-SKU
+    mini 3-way reconcile (SOD vs lcbo.com vs last rep observation) + last 5
+    touchpoints + territory/top-100 standing. Powers the /stores/[id] page."""
     db = get_db()
     ph = '%s' if USE_POSTGRES else '?'
     # Store info
@@ -16933,7 +17230,84 @@ def api_crm_store_full(store_number):
         'territory_name': s[18], 'territory_color': s[19],
         'spirits_ambassador': s[20] or '', 'store_notes': s[21] or '',
     }
-    return jsonify({'store': store, 'snapshot_date': str(_max_snapshot_date()) if _max_snapshot_date() else None})
+
+    # "Last updated by X on date" for the contacts card (from the audit trail
+    # written by PUT /api/stores/<id> — every contact save lands there).
+    lu = db_fetchone(
+        "SELECT field, new_value, changed_by, CAST(changed_at AS TEXT) AS changed_at "
+        "FROM territory_status_history "
+        "WHERE store_number=? AND field LIKE 'contact:%' "
+        "ORDER BY id DESC LIMIT 1",
+        (store_number,))
+    contacts_last_update = row_to_dict(lu) if lu else None
+
+    # Territory / top-100 standing (reps may set priority too; owner_status
+    # is writable by owner AND internal).
+    t = db_fetchone(
+        "SELECT tier, class, route_day, route_stop, priority_rank, owner_status, "
+        "owner_status_note, "
+        "CAST(owner_status_updated_at AS TEXT) AS owner_status_updated_at "
+        "FROM territory_stores WHERE store_number=? AND active",
+        (store_number,))
+    territory_info = row_to_dict(t) if t else None
+
+    # Mini 3-way reconcile: both SKUs' SOD + live qty + last rep observation
+    # side by side, with the same flag logic as /api/reconcile.
+    mini_reconcile = []
+    for sku in sorted(SOD_TRACKED_SKUS.keys()):
+        brand, pname = SOD_TRACKED_SKUS[sku]
+        s_row = db_fetchone(
+            "SELECT status, on_hand, CAST(snapshot_date AS TEXT) AS snapshot_date "
+            "FROM sod_inventory WHERE sku=? AND store_number=? "
+            "ORDER BY snapshot_date DESC LIMIT 1",
+            (sku, store_number))
+        s_d = row_to_dict(s_row) if s_row else None
+        live_map, _bid, _ca = _live_latest_per_store(sku)
+        l_d = live_map.get(store_number)
+        o_row = db_fetchone(
+            "SELECT rep, on_shelf, units, CAST(observed_at AS TEXT) AS observed_at "
+            "FROM rep_listing_observations WHERE sku=? AND store_number=? "
+            "ORDER BY observed_at DESC, id DESC LIMIT 1",
+            (sku, store_number))
+        o_d = row_to_dict(o_row) if o_row else None
+        sod_qty = (s_d['on_hand'] if s_d['on_hand'] is not None else 0) if s_d else None
+        live_qty = l_d['qty'] if l_d else None
+        rep_units = o_d['units'] if o_d else None
+        rep_on_shelf = (bool(o_d['on_shelf'])
+                        if o_d and o_d['on_shelf'] is not None else None)
+        mini_reconcile.append({
+            'sku': sku,
+            'brand': brand,
+            'product_name': pname,
+            'sod_on_hand': sod_qty,
+            'sod_status': s_d['status'] if s_d else None,
+            'sod_snapshot_date': s_d['snapshot_date'] if s_d else None,
+            'live_qty': live_qty,
+            'live_checked_at': l_d['checked_at'] if l_d else None,
+            'rep': o_d['rep'] if o_d else None,
+            'rep_units': rep_units,
+            'rep_on_shelf': rep_on_shelf,
+            'rep_observed_at': o_d['observed_at'] if o_d else None,
+            'flag': _reconcile_flag(sod_qty, live_qty, rep_units, rep_on_shelf),
+        })
+
+    # Last 5 touchpoints at this store.
+    recent_touchpoints = [row_to_dict(r) for r in db_fetchall(
+        "SELECT a.activity_type AS activity_type, a.notes AS notes, "
+        "CAST(a.created_at AS TEXT) AS created_at, rp.name AS rep "
+        "FROM activities a JOIN reps rp ON a.rep_id = rp.id "
+        "WHERE a.store_id=? AND a.deleted_at IS NULL "
+        "ORDER BY a.created_at DESC, a.id DESC LIMIT 5",
+        (store['id'],))]
+
+    return jsonify({
+        'store': store,
+        'contacts_last_update': contacts_last_update,
+        'territory': territory_info,
+        'mini_reconcile': mini_reconcile,
+        'recent_touchpoints': recent_touchpoints,
+        'snapshot_date': str(_max_snapshot_date()) if _max_snapshot_date() else None,
+    })
 
 
 @app.route('/api/crm/resolve-store', methods=['GET'])
@@ -17925,14 +18299,15 @@ def api_crm_priority_targets():
     """Priority targets for a rep — stores in their territory with ≤max_skus
     of our tracked SKUs currently listed. Server-side SQL filtering is fast.
 
-    ?rep=Namit|Surya|Ikshit|Virat|Neeraj  &max_skus=1  &days=14  &max_per_day=10
+    ?rep=Ikshit|Vaneet|Ed|Namit  &max_skus=1  &days=14  &max_per_day=10
     """
     rep = (request.args.get('rep') or '').strip()
     max_skus = int(request.args.get('max_skus', 1))
     days = max(1, min(int(request.args.get('days', 14)), 21))
     max_per_day = max(5, min(int(request.args.get('max_per_day', 10)), 14))
 
-    # Same territory map as territory-plan — keep in sync.
+    # Same territory map as territory-plan — keep in sync. 4-rep Dripp roster,
+    # GTA-focused (matches the territory_seed footprint).
     TERR = {
         'Namit': {'prefixes': ['M'],
                   'cities': ['Woodbridge','Vaughan','Maple','Markham','Stouffville',
@@ -17940,17 +18315,10 @@ def api_crm_priority_targets():
         'Ikshit': {  # Burlington + Oakville (Halton south)
             'prefixes': ['L7L','L7M','L7N','L7P','L7R','L7S','L7T'],
             'cities': ['Burlington','Oakville','Bronte']},
-        'Virat': {   # Mississauga + Milton + Caledon
+        'Vaneet': {  # Mississauga + Milton + Caledon + Brampton
             'prefixes': ['L4Z','L5','L6P','L6R','L6S','L6T','L6V','L6W','L6X','L6Y','L7A','L7C','L7E','L7G','L7K'],
             'cities': ['Mississauga','Milton','Caledon','Bolton','Georgetown','Brampton']},
-        'Surya': {
-            # IN + AROUND OTTAWA ONLY (no Kingston/Brockville/Belleville/Petawawa)
-            'prefixes': ['K1', 'K2', 'K0A', 'K4A', 'K4B', 'K4C', 'K4P', 'K4M', 'K4R'],
-            'cities': ['Ottawa','Kanata','Nepean','Orleans','Stittsville',
-                       'Manotick','Rockland','Embrun','Carleton Place',
-                       'Almonte','Smiths Falls','Gloucester','Vanier',
-                       'Russell','Kemptville','Cumberland','Greely']},
-        'Neeraj': {  # Guelph + Cambridge + KW + Hamilton (broader west of GTA)
+        'Ed': {      # Guelph + Cambridge + KW + Hamilton (broader west of GTA)
             'prefixes': ['N1','N2','N3','L8','L9G','L9H','L9J','L9K'],
             'cities': ['Guelph','Cambridge','Kitchener','Waterloo','Hamilton',
                        'Stoney Creek','Ancaster','Dundas','Acton','Rockwood',
@@ -18055,9 +18423,8 @@ def api_crm_priority_targets():
     REP_HOME = {
         'Namit':  {'lat': 43.6532, 'lng': -79.3832, 'name': 'Downtown Toronto'},
         'Ikshit': {'lat': 43.5890, 'lng': -79.6441, 'name': 'Mississauga'},
-        'Virat':  {'lat': 43.8975, 'lng': -78.9429, 'name': 'Whitby/Oshawa'},
-        'Surya':  {'lat': 45.4215, 'lng': -75.6972, 'name': 'Downtown Ottawa'},
-        'Neeraj': {'lat': 43.2557, 'lng': -79.8711, 'name': 'Hamilton'},
+        'Vaneet': {'lat': 43.5890, 'lng': -79.6441, 'name': 'Mississauga'},
+        'Ed':     {'lat': 43.2557, 'lng': -79.8711, 'name': 'Hamilton'},
     }
     home = REP_HOME.get(rep, {'lat': 43.65, 'lng': -79.38})
 
@@ -18139,9 +18506,9 @@ def api_crm_priority_targets():
 def api_crm_territory_plan():
     """Build a 14-day route plan for a rep's territory.
 
-    Two predefined territories:
+    Predefined territories (4-rep Dripp roster):
       - rep=Namit  → GTA core (postal M*) — Toronto downtown + nearby
-      - rep=Surya  → Ottawa region (postal K1, K2, K6, K7) + Kingston
+      - rep=Vaneet → Mississauga + Milton + Caledon + Brampton
 
     Algorithm:
       1. Pull all stores in territory (filtered by postal prefix)
@@ -18156,7 +18523,7 @@ def api_crm_territory_plan():
     days = max(1, min(int(request.args.get('days', 14)), 21))
     max_per_day = max(5, min(int(request.args.get('max_per_day', 9)), 14))
 
-    # 5-REP TERRITORY MAP — covers all of Ontario, postal-prefix clustered
+    # 4-REP TERRITORY MAP — GTA-focused, postal-prefix clustered
     # for fuel-efficient driving. Each rep's territory targets ~7-day cycle
     # at 8-10 stops/day (56-70 stores/week).
     TERRITORY = {
@@ -18177,7 +18544,7 @@ def api_crm_territory_plan():
             'fallback_cities': ['Burlington', 'Oakville', 'Bronte'],
             'target_min': 25, 'target_max': 45,
         },
-        'Virat': {
+        'Vaneet': {
             # Mississauga + Milton + Caledon + Brampton
             'name': 'Mississauga + Milton + Caledon + Brampton',
             'postal_prefixes': ['L4Z','L5','L6P','L6R','L6S','L6T','L6V','L6W','L6X','L6Y','L7A','L7C','L7E','L7G','L7K'],
@@ -18185,20 +18552,7 @@ def api_crm_territory_plan():
                                 'Georgetown', 'Brampton'],
             'target_min': 40, 'target_max': 70,
         },
-        'Surya': {
-            # IN + AROUND OTTAWA ONLY — Ottawa core (K1*, K2*) + immediate
-            # surrounding (K0A rural Ottawa, K4* Orleans/Cumberland).
-            # NOT: Kingston/Brockville/Belleville/Petawawa/Renfrew (too far).
-            'name': 'Ottawa + immediate surroundings',
-            'postal_prefixes': ['K1', 'K2', 'K0A', 'K4A', 'K4B', 'K4C', 'K4P', 'K4M', 'K4R'],
-            'fallback_cities': ['Ottawa', 'Kanata', 'Nepean', 'Orleans',
-                                'Stittsville', 'Manotick', 'Rockland', 'Embrun',
-                                'Carleton Place', 'Almonte', 'Smiths Falls',
-                                'Gloucester', 'Vanier', 'Russell', 'Kemptville',
-                                'Cumberland', 'Greely'],
-            'target_min': 40, 'target_max': 70,
-        },
-        'Neeraj': {
+        'Ed': {
             # Guelph + Cambridge + KW + Hamilton (west of GTA)
             'name': 'Guelph + Cambridge + KW + Hamilton',
             'postal_prefixes': ['N1', 'N2', 'N3', 'L8', 'L9G', 'L9H', 'L9J', 'L9K'],
@@ -18374,7 +18728,7 @@ def api_crm_rep_performance():
     since = (today - timedelta(days=days)).isoformat()
 
     # Always include the official roster, even with 0 activity
-    OFFICIAL_REPS = ['Ikshit', 'Virat', 'Namit', 'Surya', 'Neeraj']
+    OFFICIAL_REPS = ['Ikshit', 'Vaneet', 'Ed', 'Namit']
 
     out = {rep: {
         'rep': rep,
@@ -18923,7 +19277,7 @@ def api_crm_manager_dashboard():
     })
 
 
-REP_ROSTER_DEFAULT = ['Ikshit', 'Virat', 'Namit', 'Surya', 'Neeraj']
+REP_ROSTER_DEFAULT = ['Ikshit', 'Vaneet', 'Ed', 'Namit']
 
 # Module-level TERRITORY map — single source of truth for postal-prefix
 # routing assignments. Reps can STILL log activities anywhere; this just
@@ -18931,8 +19285,7 @@ REP_ROSTER_DEFAULT = ['Ikshit', 'Virat', 'Namit', 'Surya', 'Neeraj']
 TERRITORY_MAP = {
     'Namit': {
         # WHOLE GTA — Toronto + Durham + York + Peel (Brampton + Mississauga
-        # + Caledon + Milton + Malton) + Halton-north. Consolidated 2026-05-31
-        # per founder direction: "namit has whole in and around gta".
+        # + Caledon + Milton + Malton) + Halton-north.
         # ONLY exclusion within GTA: L7L-T (Burlington + Oakville = Ikshit).
         # Reps can still log anywhere; this is the default-assignment map.
         'name': 'Greater Toronto Area — entire',
@@ -18957,31 +19310,6 @@ TERRITORY_MAP = {
         ],
         'target_min': 220, 'target_max': 300,
     },
-    'Surya': {
-        # Ottawa METRO only — capped 50-55 stores per founder direction
-        # 2026-05-31 (Surya can't travel too rural). Includes Ottawa core
-        # + immediate ring (rural K0A) + Orleans/Cumberland/Rockland (K4)
-        # + Carleton Place / Smiths Falls (K7A/C — close enough to Ottawa).
-        # EXCLUDES the Ottawa Valley / Eastern Ontario rural reach that was
-        # in the prior wider map (Cornwall/Brockville/Hawkesbury/Pembroke/
-        # Petawawa/Renfrew/Perth/all K0B-K0J).
-        'name': 'Ottawa metro (capped 50-55 stores)',
-        'postal_prefixes': [
-            'K1', 'K2',                                    # Ottawa core (416-equivalent)
-            'K0A',                                         # Rural Ottawa ring
-            'K4A', 'K4B', 'K4C', 'K4K', 'K4M', 'K4P', 'K4R',  # Orleans/Cumberland/Rockland
-            'K7A', 'K7C',                                  # Smiths Falls + Carleton Place (close-in)
-        ],
-        'fallback_cities': [
-            'Ottawa', 'Kanata', 'Nepean', 'Orleans', 'Stittsville',
-            'Manotick', 'Rockland', 'Embrun', 'Carleton Place',
-            'Almonte', 'Smiths Falls', 'Gloucester', 'Vanier',
-            'Russell', 'Kemptville', 'Cumberland', 'Greely',
-            'Casselman', 'Limoges', 'Metcalfe', 'Osgoode',
-            'Carp', 'Richmond', 'Bourget',
-        ],
-        'target_min': 48, 'target_max': 58,
-    },
     'Ikshit': {
         # Burlington (L7L-T) + Oakville (L6H-M). Halton south.
         # NOTE: longer prefixes here beat Namit's bare 'L6' / 'L7A/C/E/G/K',
@@ -18994,10 +19322,10 @@ TERRITORY_MAP = {
         'fallback_cities': ['Burlington', 'Oakville', 'Bronte'],
         'target_min': 13, 'target_max': 30,
     },
-    # Neeraj + Virat removed from TERRITORY_MAP on 2026-05-31 — their
-    # patches (Brampton/Milton/Malton, Mississauga/Caledon) are now
-    # consolidated under Namit's "whole GTA" assignment. They can still
-    # log activities anywhere; this just removes their default stamp.
+    # Vaneet + Ed intentionally have no default-stamp patch here — the
+    # GTA footprint is consolidated under Namit's assignment. They can
+    # still log activities anywhere; this only controls the default stamp
+    # on stores.rep.
 }
 
 
@@ -19087,7 +19415,7 @@ def api_crm_admin_restamp_territories():
                            dropped from the map so stale assignments don't
                            linger). Default 0 = leave unmatched stores as-is.
 
-    This is the canonical way to assign Namit=GTA, Surya=Ottawa, etc.
+    This is the canonical way to assign Namit=GTA, Ikshit=Burlington/Oakville, etc.
     Returns per-rep counts of stores stamped.
     """
     clear_unmatched = (request.args.get('clear_unmatched') or '').strip() in ('1', 'true', 'yes')
@@ -19181,7 +19509,7 @@ def api_crm_admin_restamp_territories():
 
 @app.route('/api/crm/admin/roster', methods=['GET'])
 def api_crm_admin_roster_get():
-    """Return the configured rep roster (4 official reps for Anu)."""
+    """Return the configured rep roster (4 official reps for Dripp Tracker)."""
     return jsonify({
         'roster': REP_ROSTER_DEFAULT,
         'placeholder_for_unassigned': 'New Rep 1',
@@ -19197,7 +19525,7 @@ def api_crm_admin_set_roster():
     Sets territories.rep_name = 'New Rep 1' for any territory that has no rep
     after normalization (so the manager UI shows a placeholder).
 
-    Body (optional): {roster: ['Neeraj', 'Virat', ...]} to override defaults.
+    Body (optional): {roster: ['Vaneet', 'Ed', ...]} to override defaults.
     """
     body = request.get_json(silent=True) or {}
     roster = body.get('roster') or REP_ROSTER_DEFAULT
@@ -19266,7 +19594,7 @@ def api_crm_admin_set_roster():
 def api_crm_admin_bulk_reassign_rep():
     """Move every store from one rep to another in one shot.
 
-    Body: {from_rep: 'Tyler Weber', to_rep: 'Neeraj'}
+    Body: {from_rep: 'Tyler Weber', to_rep: 'Vaneet'}
     Useful for rolling new hires into the system.
     """
     body = request.get_json(silent=True) or {}
@@ -19722,8 +20050,13 @@ def api_crm_reps_with_stores():
 _lcbo_scheduler = None
 
 
-def _lcbo_daily_scrape_worker():
+def _lcbo_daily_scrape_worker(per_sku_rows=None):
     """Scrape live LCBO.com inventory + RECONCILE with SOD + AUTO-ONBOARD stores.
+
+    per_sku_rows: optional {sku(7-char padded): [row dicts]} already scraped by
+    run_live_batch() — when provided, NO extra HTTP requests are made (one
+    scrape per scheduler cycle feeds both this reconciler and the append-only
+    lcbo_live_snapshots engine).
 
     Three outputs:
       1. inventory_history: append-only trend log.
@@ -19757,11 +20090,18 @@ def _lcbo_daily_scrape_worker():
         for sku, (brand, pname) in SOD_TRACKED_SKUS.items():
             sku_clean = sku.lstrip('0')
             sku_padded = sku  # already 7-char zero-padded in SOD_TRACKED_SKUS
-            try:
-                rows = scrape(sku_clean) or []
-            except Exception as e:
-                print(f'[LCBO-live] scrape failed for {sku}: {e}')
-                continue
+            if per_sku_rows is not None:
+                rows = per_sku_rows.get(sku_padded) or per_sku_rows.get(sku_clean) or []
+            else:
+                try:
+                    # scrape_lcbo_inventory returns (rows, err) — unpack it.
+                    rows, _scrape_err = scrape(sku_clean)
+                    rows = rows or []
+                    if _scrape_err:
+                        print(f'[LCBO-live] scrape issue for {sku}: {_scrape_err}')
+                except Exception as e:
+                    print(f'[LCBO-live] scrape failed for {sku}: {e}')
+                    continue
 
             # Find product row for inventory_history
             if USE_POSTGRES:
@@ -20253,14 +20593,1553 @@ def api_crm_lcbo_rescan():
     return jsonify({'status': 'started', 'note': 'scraping lcbo.com for tracked SKUs'}), 202
 
 
-def start_lcbo_scheduler():
-    """Start the lcbo.com scraper every 2 hours.
+# ============================================================================
+# DRIPP: TERRITORY BOOK + LIVE LCBO.COM ENGINE + 3-WAY RECONCILIATION
+# ============================================================================
+# The heart of scoping for Dripp Tracker:
+#   - territory_stores        the 189-store book (73 routed + wider GTA)
+#   - lcbo_live_snapshots     APPEND-ONLY live scrape of lcbo.com (30-min cadence)
+#   - live_listing_events     listing changes detected between live batches
+#   - /api/reconcile          SOD vs lcbo.com vs rep observation, per store
+#   - /api/changes            new listings / delistings / restocks over X days
+# Nothing here ever deletes or overwrites a snapshot. Money depends on it.
 
-    More aggressive than the SOD scheduler because lcbo.com updates in real-time
-    when stores get new shipments, while SOD only refreshes once a day.
+from html import unescape as _html_unescape
+
+# Attribution baseline: reps start field work 2026-07-15. Listings on or
+# before this date are 'baseline'; after it they are 'rep_converted' when a
+# touchpoint precedes the listing, else 'organic'.
+LAUNCH_DATE = '2026-07-15'
+
+# Path to the seed book. Ingest is idempotent + re-runnable; never deletes.
+TERRITORY_SEED_PATH = os.path.join(BASE_DIR, 'data', 'territory_seed.json')
+
+# GTA city list for territory discovery (spec-defined). Lowercased for match.
+GTA_CITIES = frozenset(c.lower() for c in (
+    'Toronto', 'North York', 'Etobicoke', 'Scarborough', 'East York', 'York',
+    'Mississauga', 'Brampton', 'Vaughan', 'Woodbridge', 'Maple', 'Concord',
+    'Thornhill', 'Richmond Hill', 'Aurora', 'Newmarket', 'Kleinburg',
+    'King City', 'Markham', 'Stouffville', 'Bolton', 'Caledon', 'Georgetown',
+    'Acton', 'Erin', 'Orangeville', 'Tottenham', 'Bradford', 'Nobleton',
+    'Schomberg', 'Unionville', 'Oak Ridges',
+))
+
+# Proven row regex for https://www.lcbo.com/en/storeinventory/?sku=N —
+# extracts (city, name, address, qty, store#). DOTALL because the markup
+# spans lines between the <p> blocks.
+LIVE_ROW_RE = re.compile(
+    r'<p class="city_txt">(.*?)</p>.*?<p class="name_txt">(.*?)</p>.*?'
+    r'<p class="address_txt">(.*?)</p>.*?<p class="quantity_avail_txt">(\d+)</p>.*?'
+    r'href="https://www\.lcbo\.com/en/stores/[a-z0-9-]*?(\d+)"',
+    re.DOTALL,
+)
+
+# Polite gap between the 2 SKU requests in one batch. Module-level so tests
+# can zero it out.
+LIVE_SCRAPE_GAP_SECONDS = 3
+
+_live_batch_lock = threading.Lock()
+
+
+def _pad_sku(sku) -> str:
+    """Normalize any SKU spelling ('14318' / '0014318') to the 7-char padded form."""
+    return str(sku or '').strip().zfill(7)
+
+
+def _live_scrape_sku(sku):
+    """Scrape live per-store inventory for one SKU from lcbo.com storeinventory.
+
+    Returns (rows, err). Row dicts are shaped like scrape_lcbo_inventory()'s
+    output so they can feed _lcbo_daily_scrape_worker(per_sku_rows=...)
+    without re-fetching. Timeout 45s per spec.
+    """
+    if not http_requests:
+        return [], 'requests library unavailable'
+    sku_clean = str(sku).lstrip('0') or '0'
+    try:
+        resp = http_requests.get(
+            f'{LCBO_STORE_INVENTORY_URL}?sku={sku_clean}',
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-CA,en;q=0.9',
+            },
+            timeout=45,
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return [], f'http {resp.status_code}'
+        rows = []
+        seen_stores = set()
+        for city, name, address, qty, store_num in LIVE_ROW_RE.findall(resp.text):
+            try:
+                sn = int(store_num)
+                qty_int = int(qty)
+            except (TypeError, ValueError):
+                continue
+            if sn in seen_stores:
+                # lcbo.com renders each store block twice on this page
+                # (verified 2026-07-14: 238 regex matches -> 119 distinct
+                # stores for 14318, identical qty in every pair). One row
+                # per store, or every downstream count doubles.
+                continue
+            seen_stores.add(sn)
+            rows.append({
+                'store_number': str(sn),
+                'city': _html_unescape(city).strip(),
+                'intersection': _html_unescape(name).strip(),
+                'store_name': _html_unescape(name).strip(),
+                'address': _html_unescape(re.sub(r'<[^>]+>', ' ', address)).strip(),
+                'phone': '',
+                'quantity': qty_int,
+            })
+        if not rows:
+            return [], 'no store rows parsed — product may be delisted or page layout changed'
+        return rows, None
+    except Exception as e:
+        return [], f'scrape error: {e}'
+
+
+def run_live_batch(triggered_by='scheduler'):
+    """One live scrape batch: both tracked SKUs, 3s apart, APPEND-ONLY writes.
+
+    - lcbo_live_batches gets one row per batch; failures are recorded there
+      with the error text. Prior snapshots are NEVER touched (no partial
+      overwrite, no updates, no deletes).
+    - lcbo_live_snapshots gets one row per (sku, store) seen.
+    - live_listing_events records stores that appear / disappear / restock
+      versus the previous batch for that SKU, so we don't wait a day for SOD.
+    - Feeds _lcbo_daily_scrape_worker(per_sku_rows=...) with the scraped rows
+      so the legacy reconciler + auto-onboard run WITHOUT extra HTTP requests.
+
+    Runs from the scheduler thread — uses its own connection, never Flask g.
+    Returns a summary dict; never raises.
+    """
+    import uuid as _uuid
+    import time as _time
+    if not _live_batch_lock.acquire(blocking=False):
+        return {'status': 'already_running'}
+    conn = None
+    batch_id = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ') + '-' + _uuid.uuid4().hex[:6]
+    try:
+        skus = sorted(SOD_TRACKED_SKUS.keys())
+        conn = _sod_get_conn()
+        cur = conn.cursor()
+        ph = _sod_ph()
+        cur.execute(
+            f"INSERT INTO lcbo_live_batches (batch_id, triggered_by, skus, status) "
+            f"VALUES ({ph},{ph},{ph},'running')",
+            (batch_id, triggered_by, ','.join(skus)),
+        )
+        conn.commit()
+
+        errors = []
+        row_count = 0
+        store_set = set()
+        events_created = 0
+        per_sku_rows = {}
+        today_str = _toronto_today().isoformat()
+
+        for i, sku in enumerate(skus):
+            if i > 0:
+                _time.sleep(LIVE_SCRAPE_GAP_SECONDS)
+            rows, err = _live_scrape_sku(sku)
+            if err and not rows:
+                errors.append(f'{sku}: {err}')
+                continue
+            per_sku_rows[sku] = rows
+
+            # Previous batch for THIS sku = event-detection baseline.
+            cur.execute(
+                f"SELECT batch_id FROM lcbo_live_snapshots WHERE sku={ph} "
+                f"ORDER BY id DESC LIMIT 1",
+                (sku,),
+            )
+            prev_row = cur.fetchone()
+            prev_batch_id = prev_row[0] if prev_row else None
+            prev_qty = {}
+            if prev_batch_id:
+                cur.execute(
+                    f"SELECT store_number, qty FROM lcbo_live_snapshots "
+                    f"WHERE sku={ph} AND batch_id={ph}",
+                    (sku, prev_batch_id),
+                )
+                prev_qty = {int(r[0]): (r[1] or 0) for r in cur.fetchall()}
+
+            # APPEND the new snapshot rows.
+            new_qty = {}
+            for r in rows:
+                try:
+                    sn = int(r['store_number'])
+                except (TypeError, ValueError):
+                    continue
+                q = int(r.get('quantity') or 0)
+                if sn in new_qty:
+                    # Belt-and-braces for the spec invariant: one snapshot
+                    # row per (sku, store) per batch, whatever the feed.
+                    continue
+                new_qty[sn] = q
+                cur.execute(
+                    f"INSERT INTO lcbo_live_snapshots "
+                    f"(sku, store_number, qty, store_name, city, batch_id) "
+                    f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph})",
+                    (sku, sn, q, r.get('store_name', ''), r.get('city', ''), batch_id),
+                )
+                row_count += 1
+                store_set.add(sn)
+
+            # Listing events vs previous batch (skip on the very first batch —
+            # there is no baseline to diff against).
+            if prev_batch_id:
+                events = []
+                for sn, q in new_qty.items():
+                    old = prev_qty.get(sn)
+                    if old is None:
+                        events.append((sku, sn, 'LIVE_NEW_LISTING', None, q))
+                    elif q > old:
+                        events.append((sku, sn, 'LIVE_RESTOCK', old, q))
+                for sn, old in prev_qty.items():
+                    if sn not in new_qty:
+                        events.append((sku, sn, 'LIVE_DELISTED', old, None))
+                for e_sku, sn, etype, oq, nq in events:
+                    cur.execute(
+                        f"INSERT INTO live_listing_events "
+                        f"(sku, store_number, event_type, old_qty, new_qty, "
+                        f" batch_id, prev_batch_id, event_date) "
+                        f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph}) "
+                        f"ON CONFLICT (sku, store_number, event_type, batch_id) DO NOTHING",
+                        (e_sku, sn, etype, oq, nq, batch_id, prev_batch_id, today_str),
+                    )
+                    events_created += 1
+
+        status = 'ok' if not errors else ('error' if not per_sku_rows else 'partial')
+        cur.execute(
+            f"UPDATE lcbo_live_batches SET finished_at=CURRENT_TIMESTAMP, "
+            f"row_count={ph}, store_count={ph}, status={ph}, error={ph} "
+            f"WHERE batch_id={ph}",
+            (row_count, len(store_set), status, '; '.join(errors), batch_id),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        conn = None
+
+        # Feed the legacy reconciler (inventory_history trend rows,
+        # LCBO_LIVE_ONLY drift discoveries, store auto-onboard) with the rows
+        # we already have — one scrape per cycle serves both engines.
+        if per_sku_rows:
+            try:
+                _lcbo_daily_scrape_worker(per_sku_rows=per_sku_rows)
+            except Exception as e:
+                print(f'[LIVE] legacy reconciler pass failed (non-fatal): {e}')
+
+        summary = {
+            'status': status,
+            'batch_id': batch_id,
+            'triggered_by': triggered_by,
+            'skus': skus,
+            'row_count': row_count,
+            'store_count': len(store_set),
+            'events_created': events_created,
+            'errors': errors,
+        }
+        print(f"[LIVE] batch {batch_id} {status}: {row_count} rows / "
+              f"{len(store_set)} stores / {events_created} events"
+              + (f" / errors: {errors}" if errors else ''))
+        return summary
+    except Exception as e:
+        # Record the failure on the batch row; snapshots are untouched.
+        try:
+            if conn is None:
+                conn = _sod_get_conn()
+            cur = conn.cursor()
+            ph = _sod_ph()
+            cur.execute(
+                f"UPDATE lcbo_live_batches SET finished_at=CURRENT_TIMESTAMP, "
+                f"status='error', error={ph} WHERE batch_id={ph}",
+                (str(e)[:500], batch_id),
+            )
+            conn.commit()
+            cur.close()
+        except Exception as e2:
+            print(f'[LIVE] could not record batch failure: {e2}')
+        print(f'[LIVE] batch {batch_id} failed: {e}')
+        return {'status': 'error', 'batch_id': batch_id, 'error': str(e)}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        _live_batch_lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Shared lookup helpers (territory / reconcile / changes)
+# ---------------------------------------------------------------------------
+
+def _territory_audit(store_number, field, old_value, new_value, changed_by):
+    """EVERY change to priority_rank / owner_status / contacts lands here —
+    the fix-any-mistake guarantee. Append-only."""
+    db_execute(
+        "INSERT INTO territory_status_history "
+        "(store_number, field, old_value, new_value, changed_by) "
+        "VALUES (?,?,?,?,?)",
+        (int(store_number), field,
+         '' if old_value is None else str(old_value),
+         '' if new_value is None else str(new_value),
+         changed_by or ''),
+    )
+
+
+def _territory_map():
+    """{store_number: {tier, route_day, route_stop, account, city}} for active stores."""
+    out = {}
+    for r in db_fetchall(
+        "SELECT store_number, tier, route_day, route_stop, account, city "
+        "FROM territory_stores WHERE active"
+    ):
+        d = row_to_dict(r)
+        out[int(d['store_number'])] = d
+    return out
+
+
+def _sod_latest_presence(skus=None):
+    """Latest SOD snapshot per SKU → {sku: {'latest_date', 'stores': {n: {...}}}}."""
+    out = {}
+    for sku in (skus or list(SOD_TRACKED_SKUS.keys())):
+        latest = db_fetchone(
+            "SELECT CAST(MAX(snapshot_date) AS TEXT) AS d FROM sod_inventory WHERE sku=?",
+            (sku,),
+        )
+        d = row_to_dict(latest)['d'] if latest else None
+        stores = {}
+        if d:
+            for r in db_fetchall(
+                "SELECT store_number, status, on_hand, "
+                "CAST(snapshot_date AS TEXT) AS snapshot_date "
+                "FROM sod_inventory WHERE sku=? AND snapshot_date=?",
+                (sku, d),
+            ):
+                rd = row_to_dict(r)
+                stores[int(rd['store_number'])] = {
+                    'status': rd['status'],
+                    'on_hand': rd['on_hand'] if rd['on_hand'] is not None else 0,
+                    'snapshot_date': rd['snapshot_date'],
+                }
+        out[sku] = {'latest_date': d, 'stores': stores}
+    return out
+
+
+def _live_latest_per_store(sku):
+    """Latest live batch for one SKU → ({store: {...}}, batch_id, checked_at)."""
+    b = db_fetchone(
+        "SELECT batch_id FROM lcbo_live_snapshots WHERE sku=? ORDER BY id DESC LIMIT 1",
+        (sku,),
+    )
+    if not b:
+        return {}, None, None
+    batch_id = row_to_dict(b)['batch_id']
+    out = {}
+    checked_at = None
+    for r in db_fetchall(
+        "SELECT store_number, qty, store_name, city, checked_at "
+        "FROM lcbo_live_snapshots WHERE sku=? AND batch_id=?",
+        (sku, batch_id),
+    ):
+        d = row_to_dict(r)
+        ca = d['checked_at']
+        ca = ca.isoformat() if isinstance(ca, datetime) else (str(ca) if ca else None)
+        out[int(d['store_number'])] = {
+            'qty': d['qty'] if d['qty'] is not None else 0,
+            'checked_at': ca,
+            'store_name': d['store_name'] or '',
+            'city': d['city'] or '',
+        }
+        checked_at = ca
+    return out, batch_id, checked_at
+
+
+def _last_touchpoints():
+    """{store_number: {'activity_type','created_at','rep'}} — latest activity per store."""
+    rows = db_fetchall(
+        "SELECT st.store_number AS store_number, a.activity_type AS activity_type, "
+        "a.created_at AS created_at, r.name AS rep "
+        "FROM activities a "
+        "JOIN stores st ON a.store_id = st.id "
+        "JOIN reps r ON a.rep_id = r.id "
+        "WHERE a.deleted_at IS NULL "
+        "ORDER BY a.created_at ASC, a.id ASC"
+    )
+    out = {}
+    for r in rows:
+        d = row_to_dict(r)
+        ca = d['created_at']
+        ca = ca.isoformat() if isinstance(ca, datetime) else (str(ca) if ca else None)
+        out[int(d['store_number'])] = {
+            'activity_type': d['activity_type'],
+            'created_at': ca,
+            'rep': d['rep'],
+        }
+    return out
+
+
+def _first_touchpoints():
+    """{store_number: 'YYYY-MM-DD'} — EARLIEST activity date per store (attribution)."""
+    rows = db_fetchall(
+        "SELECT st.store_number AS store_number, MIN(a.created_at) AS first_touch "
+        "FROM activities a JOIN stores st ON a.store_id = st.id "
+        "WHERE a.deleted_at IS NULL GROUP BY st.store_number"
+    )
+    out = {}
+    for r in rows:
+        d = row_to_dict(r)
+        ft = d['first_touch']
+        if isinstance(ft, datetime):
+            ft = ft.date().isoformat()
+        else:
+            ft = str(ft)[:10]
+        out[int(d['store_number'])] = ft
+    return out
+
+
+def _attribution_for(store_number, listing_date, touch_first):
+    """'baseline' | 'rep_converted' | 'organic' for a new listing at a store.
+
+    A new listing (SOD or live event) after LAUNCH_DATE is rep_converted if
+    ANY touchpoint exists at the store BEFORE the listing date; else organic.
+    Listings on or before LAUNCH_DATE are baseline (pre-field-work).
+    """
+    if not listing_date:
+        return None
+    listing_date = str(listing_date)[:10]
+    if listing_date <= LAUNCH_DATE:
+        return 'baseline'
+    first = touch_first.get(int(store_number))
+    if first and first < listing_date:
+        return 'rep_converted'
+    return 'organic'
+
+
+def _reconcile_flag(sod_qty, live_qty, rep_units, rep_on_shelf):
+    """Single flag per (sku, store) — one of the 6 spec states.
+
+    All three raw values + both deltas ride along in the row, so a flag never
+    hides a diff; it names the loudest one. A source showing 0 and a source
+    with no row are treated as agreeing (lcbo.com only lists stores with stock).
+    """
+    effective_rep = rep_units
+    if effective_rep is None and rep_on_shelf is False:
+        effective_rep = 0
+    if sod_qty is None and live_qty is None:
+        if effective_rep is not None and effective_rep >= 3:
+            return 'REP_MISMATCH'
+        return 'MATCH'
+    if sod_qty is None:
+        return 'MATCH' if (live_qty or 0) == 0 else 'MISSING_FROM_SOD'
+    if live_qty is None:
+        return 'MATCH' if (sod_qty or 0) == 0 else 'MISSING_FROM_LIVE'
+    if effective_rep is not None and abs(effective_rep - live_qty) >= 3:
+        return 'REP_MISMATCH'
+    if sod_qty == live_qty:
+        return 'MATCH'
+    if sod_qty < live_qty:
+        return 'SOD_LAGS_LIVE'
+    return 'LIVE_LAGS_SOD'
+
+
+def _change_kind(change_type):
+    """Bucket a change/event type into new_listing | delisting | restock | other."""
+    if change_type in ('NEW_LISTING', 'RELISTED', 'LIVE_NEW_LISTING'):
+        return 'new_listing'
+    if change_type in ('DROPPED', 'DELISTED', 'DELISTING_NOW', 'LIVE_DELISTED'):
+        return 'delisting'
+    if change_type in ('LIVE_RESTOCK', 'RESTOCK'):
+        return 'restock'
+    return 'other'
+
+
+def _safe_int_arg(name, default):
+    try:
+        return int(request.args.get(name, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------------------
+# TERRITORY endpoints
+# ---------------------------------------------------------------------------
+
+@app.route('/api/territory/ingest', methods=['POST'])
+@require_admin_token
+def api_territory_ingest():
+    """Upsert the territory book from data/territory_seed.json.
+
+    Idempotent + re-runnable: existing rows get descriptive fields refreshed,
+    owner_status / owner_status_note / priority_rank / added_at are preserved.
+    NEVER deletes. Blank seed fields are enriched from the master stores
+    directory (766 base stores + live auto-onboard).
+    """
+    if not os.path.exists(TERRITORY_SEED_PATH):
+        return jsonify({'error': 'territory_seed.json not found',
+                        'path': TERRITORY_SEED_PATH}), 400
+    try:
+        with open(TERRITORY_SEED_PATH) as f:
+            seed = json.load(f)
+    except Exception as e:
+        return jsonify({'error': f'seed parse failed: {e}'}), 400
+    if not isinstance(seed, list) or not seed:
+        return jsonify({'error': 'seed file is empty or not a list'}), 400
+
+    stores_dir = {}
+    for r in db_fetchall("SELECT store_number, account, address, city, postal FROM stores"):
+        d = row_to_dict(r)
+        stores_dir[int(d['store_number'])] = d
+    existing = {
+        int(row_to_dict(r)['store_number'])
+        for r in db_fetchall("SELECT store_number FROM territory_stores")
+    }
+
+    inserted = updated = 0
+    for row in seed:
+        try:
+            sn = int(row['store_number'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        base = stores_dir.get(sn, {})
+        tier = (row.get('tier') or 'territory').strip()
+        klass = (row.get('class') or '').strip()
+        account = (row.get('account') or '').strip() or (base.get('account') or '') or f'LCBO #{sn}'
+        address = (row.get('address') or '').strip() or (base.get('address') or '')
+        city = (row.get('city') or '').strip() or (base.get('city') or '')
+        postal = (row.get('postal') or '').strip() or (base.get('postal') or '')
+        route_day = row.get('route_day')
+        route_stop = row.get('route_stop')
+        if sn in existing:
+            db_execute(
+                "UPDATE territory_stores SET tier=?, class=?, account=?, address=?, "
+                "city=?, postal=?, route_day=?, route_stop=?, active=? "
+                "WHERE store_number=?",
+                (tier, klass, account, address, city, postal,
+                 route_day, route_stop, True, sn),
+            )
+            updated += 1
+        else:
+            db_execute(
+                "INSERT INTO territory_stores "
+                "(store_number, tier, class, account, address, city, postal, "
+                " route_day, route_stop, source) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (sn, tier, klass, account, address, city, postal,
+                 route_day, route_stop, 'seed'),
+            )
+            existing.add(sn)
+            inserted += 1
+
+    # Default priority ranks (only where rank is still NULL — manual ranks are
+    # never clobbered): routed stores by (route_day, route_stop) sequence,
+    # then AAA / AA class territory stores. Each assignment is audited.
+    all_rows = [row_to_dict(r) for r in db_fetchall(
+        "SELECT store_number, tier, class, route_day, route_stop, priority_rank "
+        "FROM territory_stores WHERE active"
+    )]
+    taken = {r['priority_rank'] for r in all_rows if r['priority_rank'] is not None}
+    routed = sorted(
+        [r for r in all_rows if r['tier'] == 'routed'],
+        key=lambda r: (r['route_day'] or 99, r['route_stop'] or 999, int(r['store_number'])),
+    )
+    aaa_aa = sorted(
+        [r for r in all_rows if r['tier'] != 'routed' and (r['class'] or '') in ('AAA', 'AA')],
+        key=lambda r: (0 if r['class'] == 'AAA' else 1, int(r['store_number'])),
+    )
+    next_rank = 1
+    ranks_assigned = 0
+    for r in routed + aaa_aa:
+        if r['priority_rank'] is not None:
+            continue
+        while next_rank in taken:
+            next_rank += 1
+        db_execute(
+            "UPDATE territory_stores SET priority_rank=? WHERE store_number=?",
+            (next_rank, int(r['store_number'])),
+        )
+        _territory_audit(r['store_number'], 'priority_rank', None, next_rank, 'seed-default')
+        taken.add(next_rank)
+        next_rank += 1
+        ranks_assigned += 1
+
+    matched = db_fetchone(
+        "SELECT COUNT(*) AS c FROM territory_stores t "
+        "JOIN stores s ON s.store_number = t.store_number"
+    )
+    total = db_fetchone("SELECT COUNT(*) AS c FROM territory_stores")
+    db_commit()
+    _log_event('territory_ingest', 'territory', 'seed', 'admin', {
+        'inserted': inserted, 'updated': updated,
+        'default_ranks_assigned': ranks_assigned,
+    })
+    return jsonify({
+        'status': 'ok',
+        'inserted': inserted,
+        'updated': updated,
+        'total': row_to_dict(total)['c'] if total else 0,
+        'default_ranks_assigned': ranks_assigned,
+        'matched_in_stores_directory': row_to_dict(matched)['c'] if matched else 0,
+    })
+
+
+@app.route('/api/territory', methods=['GET'])
+@owner_scope
+@cached_response(ttl_seconds=120, key_args=('tier', 'city', 'q'))
+def api_territory():
+    """The territory book with per-store latest SOD SKU presence + last touchpoint.
+
+    Filters: ?tier=routed|territory|discovered, ?city=, ?q= (account/address/
+    postal/store#). lat/lng enriched from the master stores directory.
+    """
+    tier = (request.args.get('tier') or '').strip()
+    city = (request.args.get('city') or '').strip()
+    q = (request.args.get('q') or '').strip()
+
+    where = ['active']
+    params = []
+    if tier:
+        where.append('tier = ?')
+        params.append(tier)
+    if city:
+        where.append('LOWER(city) = LOWER(?)')
+        params.append(city)
+    if q:
+        like = f'%{q.lower()}%'
+        where.append(
+            "(CAST(store_number AS TEXT) LIKE ? OR LOWER(account) LIKE ? "
+            "OR LOWER(address) LIKE ? OR LOWER(postal) LIKE ?)"
+        )
+        params.extend([f'%{q}%', like, like, like])
+    rows = db_fetchall(
+        "SELECT * FROM territory_stores WHERE " + ' AND '.join(where) +
+        " ORDER BY CASE tier WHEN 'routed' THEN 0 WHEN 'territory' THEN 1 ELSE 2 END, "
+        "COALESCE(route_day, 99), COALESCE(route_stop, 999), store_number",
+        params,
+    )
+
+    latlng = {}
+    for r in db_fetchall("SELECT store_number, lat, lng, phone FROM stores"):
+        d = row_to_dict(r)
+        latlng[int(d['store_number'])] = d
+    presence = _sod_latest_presence()
+    touches = _last_touchpoints()
+
+    out = []
+    for r in rows:
+        d = row_to_dict(r)
+        sn = int(d['store_number'])
+        enrich = latlng.get(sn, {})
+        d['lat'] = enrich.get('lat')
+        d['lng'] = enrich.get('lng')
+        d['phone'] = enrich.get('phone') or ''
+        d['sku_presence'] = {
+            sku: presence[sku]['stores'].get(sn) for sku in presence
+        }
+        d['last_touchpoint'] = touches.get(sn)
+        for k in ('added_at', 'owner_status_updated_at'):
+            if isinstance(d.get(k), datetime):
+                d[k] = d[k].isoformat()
+        out.append(d)
+    return jsonify({
+        'count': len(out),
+        'stores': out,
+        'sod_latest': {sku: presence[sku]['latest_date'] for sku in presence},
+    })
+
+
+@app.route('/api/territory/discovery', methods=['GET'])
+@cached_response(ttl_seconds=300)
+def api_territory_discovery():
+    """GTA stores visible in the store universe (master directory from SOD/base
+    seed + lcbo.com live results) that are NOT yet in the territory book.
+
+    The master stores directory auto-onboards new lcbo.com stores every live
+    batch, so discovery keeps finding future new stores (e.g. #787 Kleinburg).
+    """
+    terr_all = {
+        int(row_to_dict(r)['store_number'])
+        for r in db_fetchall("SELECT store_number FROM territory_stores")
+    }
+    candidates = {}
+    for r in db_fetchall("SELECT store_number, account, address, city, postal FROM stores"):
+        d = row_to_dict(r)
+        c = (d['city'] or '').strip()
+        if c.lower() not in GTA_CITIES:
+            continue
+        sn = int(d['store_number'])
+        if sn in terr_all:
+            continue
+        candidates[sn] = {
+            'store_number': sn,
+            'account': d['account'] or f'LCBO #{sn}',
+            'address': d['address'] or '',
+            'city': c,
+            'postal': d['postal'] or '',
+            'seen_in': ['stores_directory'],
+        }
+    # Live snapshots can know a store before the master directory sync runs.
+    for sku in SOD_TRACKED_SKUS:
+        live, _bid, _ca = _live_latest_per_store(sku)
+        for sn, row in live.items():
+            c = (row.get('city') or '').strip()
+            if c.lower() not in GTA_CITIES or sn in terr_all:
+                continue
+            if sn in candidates:
+                if 'lcbo.com' not in candidates[sn]['seen_in']:
+                    candidates[sn]['seen_in'].append('lcbo.com')
+            else:
+                candidates[sn] = {
+                    'store_number': sn,
+                    'account': row.get('store_name') or f'LCBO #{sn}',
+                    'address': '',
+                    'city': c,
+                    'postal': '',
+                    'seen_in': ['lcbo.com'],
+                }
+    # Tag which tracked SKUs each candidate already carries (latest SOD view).
+    presence = _sod_latest_presence()
+    for sn, cand in candidates.items():
+        cand['carrying_skus'] = [sku for sku in presence if sn in presence[sku]['stores']]
+    ordered = sorted(candidates.values(), key=lambda c: (c['city'], c['store_number']))
+    return jsonify({'count': len(ordered), 'candidates': ordered})
+
+
+@app.route('/api/territory/discovery/add', methods=['POST'])
+@require_app_origin
+def api_territory_discovery_add():
+    """Add a discovered store to the territory book (tier='discovered').
+
+    Never deletes anything; adding an existing store is a no-op."""
+    data = request.get_json(silent=True) or {}
+    try:
+        sn = int(data.get('store_number'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'store_number (integer) is required'}), 400
+    changed_by = (data.get('added_by') or data.get('rep') or 'rep').strip()
+
+    already = db_fetchone(
+        "SELECT store_number FROM territory_stores WHERE store_number=?", (sn,))
+    if already:
+        return jsonify({'status': 'exists', 'store_number': sn})
+    base = db_fetchone(
+        "SELECT account, address, city, postal FROM stores WHERE store_number=?", (sn,))
+    base = row_to_dict(base) if base else {}
+    db_execute(
+        "INSERT INTO territory_stores "
+        "(store_number, tier, class, account, address, city, postal, source) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (sn, 'discovered', '',
+         base.get('account') or f'LCBO #{sn}',
+         base.get('address') or '',
+         base.get('city') or (data.get('city') or ''),
+         base.get('postal') or '',
+         'discovery'),
+    )
+    _territory_audit(sn, 'tier', None, 'discovered', changed_by)
+    db_commit()
+    _log_event('territory_store_added', 'territory_store', sn, changed_by,
+               {'source': 'discovery'})
+    return jsonify({'status': 'added', 'store_number': sn, 'tier': 'discovered'})
+
+
+# ---------------------------------------------------------------------------
+# LIVE LCBO.COM engine endpoints
+# ---------------------------------------------------------------------------
+
+@app.route('/api/live/refresh', methods=['POST'])
+def api_live_refresh():
+    """On-demand live scrape batch (both SKUs). Admin token, app origin, or the
+    SOD_CRON_TOKEN bearer (GitHub Action safety net) may trigger it."""
+    provided = (request.args.get('token') or '').strip()
+    if not provided:
+        auth = request.headers.get('Authorization', '')
+        if auth.startswith('Bearer '):
+            provided = auth[7:].strip()
+    cron_ok = bool(SOD_CRON_TOKEN) and provided == SOD_CRON_TOKEN
+    if not (_admin_token_ok() or _request_origin_ok() or cron_ok):
+        return jsonify({'error': 'forbidden',
+                        'detail': 'Admin token, app origin, or cron bearer required.'}), 403
+    summary = run_live_batch(triggered_by='cron' if cron_ok else 'manual')
+    _log_event('live_refresh', 'live_batch', summary.get('batch_id'),
+               'cron' if cron_ok else 'manual', summary)
+    if summary.get('status') == 'already_running':
+        return jsonify(summary), 202
+    if summary.get('status') == 'error':
+        return jsonify(summary), 502
+    return jsonify(summary)
+
+
+@app.route('/api/live/latest', methods=['GET'])
+@cached_response(ttl_seconds=60, key_args=('sku',))
+def api_live_latest():
+    """Latest live batch per store. ?sku= narrows to one SKU (any spelling)."""
+    sku_arg = (request.args.get('sku') or '').strip()
+    skus = [_pad_sku(sku_arg)] if sku_arg else sorted(SOD_TRACKED_SKUS.keys())
+    out = {}
+    for sku in skus:
+        stores, batch_id, checked_at = _live_latest_per_store(sku)
+        brand, pname = SOD_TRACKED_SKUS.get(sku, ('', ''))
+        out[sku] = {
+            'brand': brand,
+            'product_name': pname,
+            'batch_id': batch_id,
+            'checked_at': checked_at,
+            'store_count': len(stores),
+            'total_units': sum(s['qty'] for s in stores.values()),
+            'stores': [
+                dict(store_number=sn, **stores[sn]) for sn in sorted(stores)
+            ],
+        }
+    return jsonify({'skus': out})
+
+
+@app.route('/api/live/store/<int:store_number>', methods=['GET'])
+@cached_response(ttl_seconds=60, key_args=('sku', 'days'))
+def api_live_store_series(store_number):
+    """Time series of live snapshots for one store. ?sku= and ?days= (default 30)."""
+    days = _safe_int_arg('days', 30)
+    sku_arg = (request.args.get('sku') or '').strip()
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+    if sku_arg:
+        rows = db_fetchall(
+            "SELECT sku, qty, checked_at, batch_id FROM lcbo_live_snapshots "
+            "WHERE store_number=? AND sku=? AND checked_at >= ? "
+            "ORDER BY checked_at ASC, id ASC",
+            (store_number, _pad_sku(sku_arg), cutoff),
+        )
+    else:
+        rows = db_fetchall(
+            "SELECT sku, qty, checked_at, batch_id FROM lcbo_live_snapshots "
+            "WHERE store_number=? AND checked_at >= ? "
+            "ORDER BY checked_at ASC, id ASC",
+            (store_number, cutoff),
+        )
+    series = []
+    for r in rows:
+        d = row_to_dict(r)
+        ca = d['checked_at']
+        d['checked_at'] = ca.isoformat() if isinstance(ca, datetime) else str(ca)
+        d['brand'] = SOD_TRACKED_SKUS.get(d['sku'], ('', ''))[0]
+        series.append(d)
+    return jsonify({'store_number': store_number, 'days': days,
+                    'count': len(series), 'series': series})
+
+
+# ---------------------------------------------------------------------------
+# 3-WAY RECONCILIATION: SOD vs lcbo.com vs rep observation
+# ---------------------------------------------------------------------------
+
+@app.route('/api/reconcile', methods=['GET'])
+@owner_scope
+@cached_response(ttl_seconds=120, key_args=('days', 'sku'))
+def api_reconcile():
+    """Per (sku, territory store): latest SOD on-hand vs latest lcbo.com qty vs
+    latest rep observation (within ?days=, default 7), with deltas and ONE of
+    six flags: MATCH | SOD_LAGS_LIVE | LIVE_LAGS_SOD | REP_MISMATCH (|d|>=3) |
+    MISSING_FROM_SOD | MISSING_FROM_LIVE.
+
+    All raw values + last-checked timestamps for every source ride on each
+    row — a diff is never hidden. This is how "sometimes difference between
+    sod, lcbo.com and real btls" becomes visible instead of silent money loss.
+    """
+    days = _safe_int_arg('days', 7)
+    sku_arg = (request.args.get('sku') or '').strip()
+    skus = [_pad_sku(sku_arg)] if sku_arg else sorted(SOD_TRACKED_SKUS.keys())
+    territory = _territory_map()
+    if not territory:
+        return jsonify({'days': days, 'rows': [], 'summary': {},
+                        'note': 'territory book empty — run POST /api/territory/ingest'})
+
+    obs_cutoff = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+    rows_out = []
+    sources = {}
+    for sku in skus:
+        brand, pname = SOD_TRACKED_SKUS.get(sku, ('', ''))
+        sod = _sod_latest_presence([sku])[sku]
+        live, live_batch_id, live_checked_at = _live_latest_per_store(sku)
+        reps = {}
+        for r in db_fetchall(
+            "SELECT store_number, rep, on_shelf, units, notes, observed_at "
+            "FROM rep_listing_observations "
+            "WHERE sku=? AND observed_at >= ? "
+            "ORDER BY observed_at ASC, id ASC",
+            (sku, obs_cutoff),
+        ):
+            d = row_to_dict(r)
+            oa = d['observed_at']
+            d['observed_at'] = oa.isoformat() if isinstance(oa, datetime) else str(oa)
+            reps[int(d['store_number'])] = d  # last write wins = latest
+        sources[sku] = {
+            'sod_latest_snapshot': sod['latest_date'],
+            'live_batch_id': live_batch_id,
+            'live_checked_at': live_checked_at,
+            'rep_observation_window_days': days,
+        }
+        for sn, tinfo in territory.items():
+            s = sod['stores'].get(sn)
+            l = live.get(sn)
+            o = reps.get(sn)
+            if s is None and l is None and o is None:
+                continue
+            sod_qty = s['on_hand'] if s else None
+            live_qty = l['qty'] if l else None
+            rep_units = o['units'] if o else None
+            rep_on_shelf = (bool(o['on_shelf']) if o and o['on_shelf'] is not None else None)
+            flag = _reconcile_flag(sod_qty, live_qty, rep_units, rep_on_shelf)
+            rows_out.append({
+                'sku': sku,
+                'brand': brand,
+                'product_name': pname,
+                'store_number': sn,
+                'account': tinfo.get('account') or '',
+                'city': tinfo.get('city') or '',
+                'tier': tinfo.get('tier'),
+                'route_day': tinfo.get('route_day'),
+                'sod_on_hand': sod_qty,
+                'sod_status': s['status'] if s else None,
+                'sod_snapshot_date': s['snapshot_date'] if s else None,
+                'live_qty': live_qty,
+                'live_checked_at': l['checked_at'] if l else None,
+                'rep_units': rep_units,
+                'rep_on_shelf': rep_on_shelf,
+                'rep_observed_at': o['observed_at'] if o else None,
+                'rep': o['rep'] if o else None,
+                'delta_sod_live': (sod_qty - live_qty)
+                    if (sod_qty is not None and live_qty is not None) else None,
+                'delta_rep_live': (rep_units - live_qty)
+                    if (rep_units is not None and live_qty is not None) else None,
+                'flag': flag,
+            })
+    summary = {}
+    for r in rows_out:
+        summary[r['flag']] = summary.get(r['flag'], 0) + 1
+    rows_out.sort(key=lambda r: (r['flag'] == 'MATCH', r['sku'], r['store_number']))
+    return jsonify({'days': days, 'rows': rows_out, 'summary': summary,
+                    'sources': sources})
+
+
+# ---------------------------------------------------------------------------
+# LISTINGS / DELISTINGS / RESTOCKS over X days (SOD engine + live events)
+# ---------------------------------------------------------------------------
+
+@app.route('/api/changes', methods=['GET'])
+@owner_scope
+@cached_response(ttl_seconds=120, key_args=('days', 'sku'))
+def api_changes():
+    """New listings, delistings and restocks over ?days= (default 7; UI presets
+    7/14/30/60). Merges the daily SOD change engine (sod_store_sku_changes)
+    with same-day live events (live_listing_events). Every row is tagged
+    tier + route_day (territory) + attribution (baseline/rep_converted/organic).
+    """
+    days = _safe_int_arg('days', 7)
+    sku_arg = (request.args.get('sku') or '').strip()
+    sku_pad = _pad_sku(sku_arg) if sku_arg else None
+    since = (_toronto_today() - timedelta(days=days)).isoformat()
+    territory = _territory_map()
+    touch_first = _first_touchpoints()
+    tracked = set(SOD_TRACKED_SKUS.keys())
+
+    out = []
+    # 1) Daily SOD change engine.
+    if sku_pad:
+        sod_rows = db_fetchall(
+            "SELECT sku, store_number, CAST(change_date AS TEXT) AS change_date, "
+            "old_status, new_status, change_type, detected_at "
+            "FROM sod_store_sku_changes WHERE change_date >= ? AND sku = ? "
+            "ORDER BY change_date DESC, id DESC",
+            (since, sku_pad),
+        )
+    else:
+        sod_rows = db_fetchall(
+            "SELECT sku, store_number, CAST(change_date AS TEXT) AS change_date, "
+            "old_status, new_status, change_type, detected_at "
+            "FROM sod_store_sku_changes WHERE change_date >= ? "
+            "ORDER BY change_date DESC, id DESC",
+            (since,),
+        )
+    for r in sod_rows:
+        d = row_to_dict(r)
+        if d['sku'] not in tracked:
+            continue
+        sn = int(d['store_number'])
+        tinfo = territory.get(sn) or {}
+        kind = _change_kind(d['change_type'])
+        det = d['detected_at']
+        out.append({
+            'source': 'sod',
+            'sku': d['sku'],
+            'brand': SOD_TRACKED_SKUS.get(d['sku'], ('', ''))[0],
+            'product_name': SOD_TRACKED_SKUS.get(d['sku'], ('', ''))[1],
+            'store_number': sn,
+            'change_type': d['change_type'],
+            'kind': kind,
+            'date': d['change_date'],
+            'old_status': d['old_status'],
+            'new_status': d['new_status'],
+            'old_qty': None,
+            'new_qty': None,
+            'detected_at': det.isoformat() if isinstance(det, datetime) else str(det),
+            'in_territory': sn in territory,
+            'tier': tinfo.get('tier'),
+            'route_day': tinfo.get('route_day'),
+            'attribution': _attribution_for(sn, d['change_date'], touch_first)
+                if kind == 'new_listing' else None,
+        })
+    # 2) Live listing events (same-day signal — no waiting for SOD).
+    if sku_pad:
+        live_rows = db_fetchall(
+            "SELECT sku, store_number, event_type, old_qty, new_qty, "
+            "CAST(event_date AS TEXT) AS event_date, detected_at, batch_id "
+            "FROM live_listing_events WHERE event_date >= ? AND sku = ? "
+            "ORDER BY event_date DESC, id DESC",
+            (since, sku_pad),
+        )
+    else:
+        live_rows = db_fetchall(
+            "SELECT sku, store_number, event_type, old_qty, new_qty, "
+            "CAST(event_date AS TEXT) AS event_date, detected_at, batch_id "
+            "FROM live_listing_events WHERE event_date >= ? "
+            "ORDER BY event_date DESC, id DESC",
+            (since,),
+        )
+    for r in live_rows:
+        d = row_to_dict(r)
+        sn = int(d['store_number'])
+        tinfo = territory.get(sn) or {}
+        kind = _change_kind(d['event_type'])
+        det = d['detected_at']
+        out.append({
+            'source': 'live',
+            'sku': d['sku'],
+            'brand': SOD_TRACKED_SKUS.get(d['sku'], ('', ''))[0],
+            'product_name': SOD_TRACKED_SKUS.get(d['sku'], ('', ''))[1],
+            'store_number': sn,
+            'change_type': d['event_type'],
+            'kind': kind,
+            'date': d['event_date'],
+            'old_status': None,
+            'new_status': None,
+            'old_qty': d['old_qty'],
+            'new_qty': d['new_qty'],
+            'detected_at': det.isoformat() if isinstance(det, datetime) else str(det),
+            'in_territory': sn in territory,
+            'tier': tinfo.get('tier'),
+            'route_day': tinfo.get('route_day'),
+            'attribution': _attribution_for(sn, d['event_date'], touch_first)
+                if kind == 'new_listing' else None,
+        })
+
+    out.sort(key=lambda r: (r['date'] or '', r['detected_at'] or ''), reverse=True)
+    summary = {
+        'new_listings': sum(1 for r in out if r['kind'] == 'new_listing'),
+        'delistings': sum(1 for r in out if r['kind'] == 'delisting'),
+        'restocks': sum(1 for r in out if r['kind'] == 'restock'),
+        'in_territory': sum(1 for r in out if r['in_territory']),
+        'rep_converted': sum(1 for r in out if r['attribution'] == 'rep_converted'),
+        'organic': sum(1 for r in out if r['attribution'] == 'organic'),
+        'baseline': sum(1 for r in out if r['attribution'] == 'baseline'),
+    }
+    return jsonify({'days': days, 'since': since, 'count': len(out),
+                    'rows': out, 'summary': summary})
+
+
+# ---------------------------------------------------------------------------
+# ATTRIBUTION + CONVERSION — did rep field work turn into listings?
+# ---------------------------------------------------------------------------
+
+def _new_listings_window(since, sku_pad=None):
+    """Deduped new listings per (sku, store) since `since`, merged from BOTH
+    engines (daily SOD changes + same-day live events). Earliest sighting
+    wins — attribution always judges the FIRST time a listing appeared."""
+    listings = {}
+    params = [since]
+    if sku_pad:
+        params.append(sku_pad)
+    queries = (
+        ('sod',
+         "SELECT sku, store_number, CAST(change_date AS TEXT) AS d, "
+         "change_type AS ctype FROM sod_store_sku_changes WHERE change_date >= ?"
+         + (" AND sku = ?" if sku_pad else "")),
+        ('live',
+         "SELECT sku, store_number, CAST(event_date AS TEXT) AS d, "
+         "event_type AS ctype FROM live_listing_events WHERE event_date >= ?"
+         + (" AND sku = ?" if sku_pad else "")),
+    )
+    for source, q in queries:
+        for r in db_fetchall(q, params):
+            row = row_to_dict(r)
+            if row['sku'] not in SOD_TRACKED_SKUS:
+                continue
+            if _change_kind(row['ctype']) != 'new_listing':
+                continue
+            key = (row['sku'], int(row['store_number']))
+            d = (row['d'] or '')[:10]
+            if key not in listings or (d and d < listings[key]['date']):
+                listings[key] = {'date': d, 'source': source}
+    return listings
+
+
+def _first_touch_info():
+    """{store_number: {'activity_type','created_at','rep'}} — EARLIEST activity
+    per store, with rep + type for the human-readable touch description."""
+    out = {}
+    for r in db_fetchall(
+        "SELECT st.store_number AS store_number, a.activity_type AS activity_type, "
+        "CAST(a.created_at AS TEXT) AS created_at, rp.name AS rep "
+        "FROM activities a "
+        "JOIN stores st ON a.store_id = st.id "
+        "JOIN reps rp ON a.rep_id = rp.id "
+        "WHERE a.deleted_at IS NULL "
+        "ORDER BY a.created_at ASC, a.id ASC"
+    ):
+        d = row_to_dict(r)
+        sn = int(d['store_number'])
+        if sn not in out:
+            out[sn] = d
+    return out
+
+
+@app.route('/api/conversion', methods=['GET'])
+@owner_scope
+@cached_response(ttl_seconds=120, key_args=('days', 'sku'))
+def api_conversion():
+    """Attribution scoreboard over ?days= (default 30): every new listing
+    after LAUNCH_DATE is 'rep_converted' when ANY touchpoint preceded it at
+    that store, else 'organic'; on/before LAUNCH_DATE it is 'baseline'.
+    Owner-safe via ?view=owner (rep names become "Rep", server-side)."""
+    days = _safe_int_arg('days', 30)
+    sku_arg = (request.args.get('sku') or '').strip()
+    sku_pad = _pad_sku(sku_arg) if sku_arg else None
+    since = (_toronto_today() - timedelta(days=days)).isoformat()
+
+    tp = db_fetchone(
+        "SELECT COUNT(*) AS c, COUNT(DISTINCT store_id) AS s FROM activities "
+        "WHERE deleted_at IS NULL AND created_at >= ?", (since,))
+    tp_d = row_to_dict(tp) if tp else {}
+    touchpoints = tp_d.get('c') or 0
+    stores_touched = tp_d.get('s') or 0
+
+    first_info = _first_touch_info()
+    touch_first = {sn: (d['created_at'] or '')[:10] for sn, d in first_info.items()}
+    territory = _territory_map()
+    listings = _new_listings_window(since, sku_pad)
+
+    per_store = []
+    counts = {'rep_converted': 0, 'organic': 0, 'baseline': 0}
+    for (sku, sn), info in sorted(listings.items(),
+                                  key=lambda kv: (kv[1]['date'], kv[0][1])):
+        attribution = _attribution_for(sn, info['date'], touch_first)
+        if attribution in counts:
+            counts[attribution] += 1
+        ft = first_info.get(sn)
+        tinfo = territory.get(sn) or {}
+        per_store.append({
+            'sku': sku,
+            'brand': SOD_TRACKED_SKUS.get(sku, ('', ''))[0],
+            'store_number': sn,
+            'account': tinfo.get('account') or '',
+            'city': tinfo.get('city') or '',
+            'tier': tinfo.get('tier'),
+            'in_territory': sn in territory,
+            'listing_date': info['date'],
+            'source': info['source'],
+            'attribution': attribution,
+            'first_touch_date': touch_first.get(sn),
+            'rep': ft['rep'] if ft else None,
+            'touch_description': (
+                f"{ft['rep']} {ft['activity_type']} on {(ft['created_at'] or '')[:10]}"
+                if ft else None),
+        })
+    convertible = counts['rep_converted'] + counts['organic']
+    return jsonify({
+        'days': days,
+        'since': since,
+        'launch_date': LAUNCH_DATE,
+        'touchpoints': touchpoints,
+        'stores_touched': stores_touched,
+        'new_listings': len(per_store),
+        'rep_converted': counts['rep_converted'],
+        'organic': counts['organic'],
+        'baseline': counts['baseline'],
+        'conversion_rate': (round(100.0 * counts['rep_converted'] / convertible, 1)
+                            if convertible else 0.0),
+        'per_store': per_store,
+    })
+
+
+# ---------------------------------------------------------------------------
+# TOP-100 PRIORITY BOARD — the owner's working surface (their ONLY two writes)
+# ---------------------------------------------------------------------------
+
+OWNER_STATUSES = ('none', 'listing_received', 'order_received', 'completed')
+
+# Ranked stores first (manual + seed-default ranks), then AAA/AA class, then
+# tier. `(priority_rank IS NULL)` sorts false<true on BOTH Postgres and SQLite
+# — portable NULLS LAST.
+_TOP100_ORDER_SQL = (
+    " ORDER BY (priority_rank IS NULL), priority_rank, "
+    "CASE class WHEN 'AAA' THEN 0 WHEN 'AA' THEN 1 WHEN 'A' THEN 2 ELSE 3 END, "
+    "CASE tier WHEN 'routed' THEN 0 WHEN 'territory' THEN 1 ELSE 2 END, "
+    "store_number "
+)
+
+
+@app.route('/api/top100', methods=['GET'])
+@owner_scope
+@cached_response(ttl_seconds=60)
+def api_top100():
+    """The top-100 board: territory stores by priority_rank (NULLS LAST),
+    class, tier — capped 100 — each with latest SKU presence for both SKUs,
+    SOD on-hand, live qty, last touchpoint, owner_status and conversion tag."""
+    rows = [row_to_dict(r) for r in db_fetchall(
+        "SELECT store_number, tier, class, account, address, city, postal, "
+        "route_day, route_stop, priority_rank, owner_status, owner_status_note, "
+        "CAST(owner_status_updated_at AS TEXT) AS owner_status_updated_at "
+        "FROM territory_stores WHERE active" + _TOP100_ORDER_SQL + "LIMIT 100")]
+
+    presence = _sod_latest_presence()
+    live_maps = {sku: _live_latest_per_store(sku)[0] for sku in SOD_TRACKED_SKUS}
+    touches = _last_touchpoints()
+    touch_first = _first_touchpoints()
+    listings = _new_listings_window('1970-01-01')
+
+    for d in rows:
+        sn = int(d['store_number'])
+        skus = {}
+        for sku in sorted(SOD_TRACKED_SKUS.keys()):
+            s = presence[sku]['stores'].get(sn)
+            l = live_maps[sku].get(sn)
+            key = (sku, sn)
+            att = (_attribution_for(sn, listings[key]['date'], touch_first)
+                   if key in listings else None)
+            skus[sku] = {
+                'brand': SOD_TRACKED_SKUS[sku][0],
+                'listed': s is not None,
+                'sod_status': s['status'] if s else None,
+                'on_hand': s['on_hand'] if s else None,
+                'live_qty': l['qty'] if l else None,
+                'conversion': att,
+            }
+        d['skus'] = skus
+        d['last_touchpoint'] = touches.get(sn)
+        d['conversion'] = next(
+            (skus[k]['conversion'] for k in sorted(skus) if skus[k]['conversion']), None)
+
+    return jsonify({'count': len(rows), 'rows': rows,
+                    'owner_statuses': list(OWNER_STATUSES)})
+
+
+def _top100_actor(data):
+    """Who made this write — 'owner' in owner view, else the rep name given."""
+    if _owner_view():
+        return 'owner'
+    return (str(data.get('changed_by') or data.get('rep') or '').strip() or 'rep')
+
+
+@app.route('/api/top100/priority', methods=['POST'])
+@require_app_origin
+def api_top100_priority():
+    """Set (or clear, rank=null) a store's priority_rank. ALWAYS audited to
+    territory_status_history with changed_by ('owner' or the rep name)."""
+    data = request.get_json(silent=True) or {}
+    try:
+        sn = int(data.get('store_number'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'store_number (integer) is required'}), 400
+    rank_raw = data.get('rank', data.get('priority_rank'))
+    rank = None
+    if rank_raw is not None and str(rank_raw).strip() != '':
+        try:
+            rank = int(rank_raw)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'rank must be an integer or null'}), 400
+        if rank < 1:
+            return jsonify({'error': 'rank must be >= 1'}), 400
+    row = db_fetchone(
+        "SELECT priority_rank FROM territory_stores WHERE store_number=? AND active",
+        (sn,))
+    if not row:
+        return jsonify({'error': f'store {sn} is not in the territory book'}), 404
+    old_rank = row_to_dict(row)['priority_rank']
+    changed_by = _top100_actor(data)
+    db_execute("UPDATE territory_stores SET priority_rank=? WHERE store_number=?",
+               (rank, sn))
+    _territory_audit(sn, 'priority_rank', old_rank, rank, changed_by)
+    db_commit()
+    _log_event('top100_priority', 'territory_store', sn, changed_by,
+               {'old': old_rank, 'new': rank})
+    return jsonify({'status': 'ok', 'store_number': sn, 'old_rank': old_rank,
+                    'rank': rank, 'changed_by': changed_by})
+
+
+@app.route('/api/top100/status', methods=['POST'])
+@require_app_origin
+def api_top100_status():
+    """Set a store's owner_status (+ optional note). ALWAYS audited to
+    territory_status_history with changed_by ('owner' or the rep name)."""
+    data = request.get_json(silent=True) or {}
+    try:
+        sn = int(data.get('store_number'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'store_number (integer) is required'}), 400
+    status = (str(data.get('owner_status') or data.get('status') or '')).strip().lower()
+    if status not in OWNER_STATUSES:
+        return jsonify({'error': "owner_status must be one of: "
+                                 + ', '.join(OWNER_STATUSES)}), 400
+    note = data.get('note', data.get('owner_status_note'))
+    row = db_fetchone(
+        "SELECT owner_status, owner_status_note FROM territory_stores "
+        "WHERE store_number=? AND active", (sn,))
+    if not row:
+        return jsonify({'error': f'store {sn} is not in the territory book'}), 404
+    old = row_to_dict(row)
+    changed_by = _top100_actor(data)
+    if note is None:
+        db_execute(
+            "UPDATE territory_stores SET owner_status=?, "
+            "owner_status_updated_at=CURRENT_TIMESTAMP WHERE store_number=?",
+            (status, sn))
+    else:
+        db_execute(
+            "UPDATE territory_stores SET owner_status=?, owner_status_note=?, "
+            "owner_status_updated_at=CURRENT_TIMESTAMP WHERE store_number=?",
+            (status, str(note), sn))
+    _territory_audit(sn, 'owner_status', old['owner_status'], status, changed_by)
+    if note is not None and str(note) != (old['owner_status_note'] or ''):
+        _territory_audit(sn, 'owner_status_note', old['owner_status_note'],
+                         str(note), changed_by)
+    db_commit()
+    _log_event('top100_status', 'territory_store', sn, changed_by,
+               {'old': old['owner_status'], 'new': status})
+    return jsonify({'status': 'ok', 'store_number': sn, 'owner_status': status,
+                    'changed_by': changed_by})
+
+
+@app.route('/api/top100/funnel', methods=['GET'])
+@owner_scope
+@cached_response(ttl_seconds=60)
+def api_top100_funnel():
+    """Conversion-by-priority: how many of the top-100 board reached each
+    owner_status (none -> listing_received -> order_received -> completed)."""
+    rows = [row_to_dict(r) for r in db_fetchall(
+        "SELECT store_number, owner_status FROM territory_stores WHERE active"
+        + _TOP100_ORDER_SQL + "LIMIT 100")]
+    funnel = {s: 0 for s in OWNER_STATUSES}
+    for r in rows:
+        key = r['owner_status'] if r['owner_status'] in funnel else 'none'
+        funnel[key] += 1
+    return jsonify({'board_size': len(rows), 'funnel': funnel,
+                    'order': list(OWNER_STATUSES)})
+
+
+@app.route('/api/owner/check', methods=['POST'])
+def api_owner_check():
+    """Server-side owner passcode check against the OWNER_PASSCODE env var.
+
+    Returns only {'ok': true|false} — the passcode never ships in frontend
+    JS. This is the convenience gate for /owner; the real protection is the
+    server-side owner-view anonymization on every X-View: owner response.
+    An unset OWNER_PASSCODE always denies (fail closed).
+    """
+    data = request.get_json(silent=True) or {}
+    supplied = str(data.get('passcode') or '')
+    expected = (os.environ.get('OWNER_PASSCODE') or '').strip()
+    ok = bool(expected) and _hmac.compare_digest(supplied, expected)
+    if not ok:
+        _log_event('owner_check_failed', 'owner', 'gate', 'owner', {})
+    return jsonify({'ok': ok})
+
+
+# ---------------------------------------------------------------------------
+# EXPORTS — real .xlsx downloads (openpyxl is already in requirements).
+# Each export re-reads its sibling JSON endpoint inside THIS request context,
+# so what downloads is byte-for-byte what the screen shows — including
+# owner-mode anonymization when ?view=owner rides on the export URL.
+# ---------------------------------------------------------------------------
+
+def _xlsx_response(filename, sheet_title, headers, rows):
+    """Build a one-sheet workbook and return it with download-ready headers."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    wb = Workbook()
+    ws = wb.active
+    ws.title = (sheet_title or 'Sheet1')[:31]
+    ws.append(list(headers))
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    for row in rows:
+        ws.append([
+            v if (isinstance(v, (int, float)) and not isinstance(v, bool))
+            else ('' if v is None else str(v))
+            for v in row
+        ])
+    ws.freeze_panes = 'A2'
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return Response(
+        buf.getvalue(),
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        headers={
+            'Content-Disposition': f'attachment; filename="{filename}"',
+            'X-Filename': filename,
+        },
+    )
+
+
+def _api_json(view_name):
+    """Call a sibling endpoint's view function in the current request context
+    and parse its JSON (cache + owner scrubbing both apply exactly as they
+    would for a direct call)."""
+    result = app.view_functions[view_name]()
+    resp = result[0] if isinstance(result, tuple) else result
+    return json.loads(resp.get_data(as_text=True))
+
+
+@app.route('/api/export/top100.xlsx')
+def api_export_top100_xlsx():
+    data = _api_json('api_top100')
+    skus = sorted(SOD_TRACKED_SKUS.keys())
+    headers = ['Rank', 'Store #', 'Account', 'City', 'Tier', 'Class',
+               'Route Day', 'Owner Status', 'Owner Note']
+    for sku in skus:
+        b = SOD_TRACKED_SKUS[sku][0]
+        headers += [f'{b} Listed', f'{b} SOD On-Hand', f'{b} Live Qty',
+                    f'{b} Conversion']
+    headers += ['Last Touch Type', 'Last Touch Date', 'Last Touch Rep']
+    rows = []
+    for r in data.get('rows', []):
+        row = [r.get('priority_rank'), r.get('store_number'), r.get('account'),
+               r.get('city'), r.get('tier'), r.get('class'), r.get('route_day'),
+               r.get('owner_status'), r.get('owner_status_note')]
+        for sku in skus:
+            sd = (r.get('skus') or {}).get(sku) or {}
+            row += ['yes' if sd.get('listed') else 'no', sd.get('on_hand'),
+                    sd.get('live_qty'), sd.get('conversion')]
+        lt = r.get('last_touchpoint') or {}
+        row += [lt.get('activity_type'), (lt.get('created_at') or '')[:10],
+                lt.get('rep')]
+        rows.append(row)
+    return _xlsx_response(f'dripp_top100_{_toronto_today().isoformat()}.xlsx',
+                          'Top 100', headers, rows)
+
+
+@app.route('/api/export/territory.xlsx')
+def api_export_territory_xlsx():
+    data = _api_json('api_territory')
+    skus = sorted(SOD_TRACKED_SKUS.keys())
+    headers = ['Store #', 'Tier', 'Class', 'Account', 'Address', 'City',
+               'Postal', 'Route Day', 'Route Stop', 'Priority Rank',
+               'Owner Status']
+    for sku in skus:
+        b = SOD_TRACKED_SKUS[sku][0]
+        headers += [f'{b} Status', f'{b} On-Hand']
+    headers += ['Last Touch Type', 'Last Touch Date', 'Last Touch Rep']
+    rows = []
+    for s in data.get('stores', []):
+        row = [s.get('store_number'), s.get('tier'), s.get('class'),
+               s.get('account'), s.get('address'), s.get('city'),
+               s.get('postal'), s.get('route_day'), s.get('route_stop'),
+               s.get('priority_rank'), s.get('owner_status')]
+        for sku in skus:
+            p = (s.get('sku_presence') or {}).get(sku) or {}
+            row += [p.get('status'), p.get('on_hand')]
+        lt = s.get('last_touchpoint') or {}
+        row += [lt.get('activity_type'), (lt.get('created_at') or '')[:10],
+                lt.get('rep')]
+        rows.append(row)
+    return _xlsx_response(f'dripp_territory_{_toronto_today().isoformat()}.xlsx',
+                          'Territory', headers, rows)
+
+
+@app.route('/api/export/changes.xlsx')
+def api_export_changes_xlsx():
+    data = _api_json('api_changes')
+    days = data.get('days', 7)
+    headers = ['Date', 'Source', 'Kind', 'Change Type', 'Brand', 'SKU',
+               'Store #', 'In Territory', 'Tier', 'Route Day', 'Old Status',
+               'New Status', 'Old Qty', 'New Qty', 'Attribution']
+    rows = [[r.get('date'), r.get('source'), r.get('kind'),
+             r.get('change_type'), r.get('brand'), r.get('sku'),
+             r.get('store_number'), 'yes' if r.get('in_territory') else 'no',
+             r.get('tier'), r.get('route_day'), r.get('old_status'),
+             r.get('new_status'), r.get('old_qty'), r.get('new_qty'),
+             r.get('attribution')] for r in data.get('rows', [])]
+    return _xlsx_response(
+        f'dripp_changes_{days}d_{_toronto_today().isoformat()}.xlsx',
+        f'Changes {days}d', headers, rows)
+
+
+@app.route('/api/export/reconcile.xlsx')
+def api_export_reconcile_xlsx():
+    data = _api_json('api_reconcile')
+    headers = ['Flag', 'Brand', 'SKU', 'Store #', 'Account', 'City', 'Tier',
+               'SOD On-Hand', 'SOD Status', 'SOD Snapshot', 'Live Qty',
+               'Live Checked', 'Rep Units', 'Rep On Shelf', 'Rep Observed',
+               'Rep', 'Delta SOD-Live', 'Delta Rep-Live']
+    rows = [[r.get('flag'), r.get('brand'), r.get('sku'), r.get('store_number'),
+             r.get('account'), r.get('city'), r.get('tier'),
+             r.get('sod_on_hand'), r.get('sod_status'),
+             r.get('sod_snapshot_date'), r.get('live_qty'),
+             r.get('live_checked_at'), r.get('rep_units'),
+             ('' if r.get('rep_on_shelf') is None
+              else ('yes' if r.get('rep_on_shelf') else 'no')),
+             r.get('rep_observed_at'), r.get('rep'),
+             r.get('delta_sod_live'), r.get('delta_rep_live')]
+            for r in data.get('rows', [])]
+    return _xlsx_response(f'dripp_reconcile_{_toronto_today().isoformat()}.xlsx',
+                          'Reconcile', headers, rows)
+
+
+@app.route('/api/export/visits.xlsx')
+def api_export_visits_xlsx():
+    days = _safe_int_arg('days', 90)
+    since = (_toronto_today() - timedelta(days=days)).isoformat()
+    dicts = [row_to_dict(r) for r in db_fetchall(
+        "SELECT CAST(a.created_at AS TEXT) AS created_at, "
+        "st.store_number AS store_number, st.account AS account, "
+        "st.city AS city, rp.name AS rep, a.activity_type AS activity_type, "
+        "a.producer AS producer, a.venue_type AS venue_type, "
+        "a.notes AS notes, a.follow_up_date AS follow_up_date "
+        "FROM activities a "
+        "JOIN stores st ON a.store_id = st.id "
+        "JOIN reps rp ON a.rep_id = rp.id "
+        "WHERE a.deleted_at IS NULL AND a.created_at >= ? "
+        "ORDER BY a.created_at DESC, a.id DESC",
+        (since,))]
+    if _owner_view():
+        dicts = _owner_sanitize(dicts)
+    headers = ['Date/Time', 'Store #', 'Account', 'City', 'Rep', 'Activity',
+               'Producer', 'Venue', 'Notes', 'Follow-Up']
+    rows = [[d.get('created_at'), d.get('store_number'), d.get('account'),
+             d.get('city'), d.get('rep'), d.get('activity_type'),
+             d.get('producer'), d.get('venue_type'), d.get('notes'),
+             d.get('follow_up_date')] for d in dicts]
+    return _xlsx_response(
+        f'dripp_visits_{days}d_{_toronto_today().isoformat()}.xlsx',
+        'Visits', headers, rows)
+
+
+def start_lcbo_scheduler():
+    """Start the live lcbo.com engine: run_live_batch every 30 min, 08:00-21:00 ET.
+
+    LCBO.com data does not move faster than this — per-second polling is not
+    real and would get the IP blocked. This cadence plus the on-demand
+    POST /api/live/refresh IS the honest "live". Each batch appends to
+    lcbo_live_snapshots, detects live_listing_events, and feeds the legacy
+    reconciler (LCBO_LIVE_ONLY drift + store auto-onboard) with the same rows.
     """
     global _lcbo_scheduler
     if _lcbo_scheduler is not None:
+        return
+    if os.environ.get('PYTEST_CURRENT_TEST') or os.environ.get('DISABLE_SCHEDULERS'):
+        print('[LIVE] scheduler NOT started (test run / DISABLE_SCHEDULERS)')
         return
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
@@ -20273,13 +22152,12 @@ def start_lcbo_scheduler():
             sched = BackgroundScheduler(timezone='America/Toronto')
         except Exception:
             sched = BackgroundScheduler()
-        # Every 30 minutes from 06:00 to 23:00 ET (35 runs/day) — near-realtime.
-        # User asked for "by-the-second" — this is the closest we can get without
-        # rate-limiting LCBO.com. Each run reconciles tracked SKUs against SOD.
+        # Every 30 minutes between 08:00 and 21:00 ET (08:00 ... 20:30, 26
+        # runs/day) — the store-hours window where inventory actually moves.
         sched.add_job(
-            _lcbo_daily_scrape_worker,
-            CronTrigger(hour='6-23', minute='0,30'),
-            id='lcbo_30min_scrape',
+            lambda: run_live_batch(triggered_by='scheduler'),
+            CronTrigger(hour='8-20', minute='0,30'),
+            id='live_30min_batch',
             replace_existing=True,
             max_instances=1,
             coalesce=True,
@@ -20287,7 +22165,8 @@ def start_lcbo_scheduler():
         )
         sched.start()
         _lcbo_scheduler = sched
-        print(f'[LCBO-live] Daily scraper scheduled for 04:00 ET')
+        next_run = sched.get_job('live_30min_batch').next_run_time
+        print(f'[LIVE] scheduler started — every 30 min 08:00-21:00 ET (next: {next_run})')
     except Exception as e:
         print(f'[LCBO-live] scheduler failed: {e}')
 
@@ -20298,7 +22177,7 @@ init_db()
 seed_data()
 seed_territories()
 refresh_sod_product_categories()
-# Ensure all 5 official reps exist in the reps table on every boot.
+# Ensure all official reps exist in the reps table on every boot.
 # Without this, /api/reps returns only reps that have already logged activity
 # (chicken-and-egg) and the dropdown is missing names. Idempotent.
 try:
@@ -20346,5 +22225,5 @@ start_backup_scheduler()
 start_tasting_digest_scheduler()
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5050))
+    port = int(os.environ.get('PORT', 5070))
     app.run(debug=os.environ.get('FLASK_DEBUG', 'true').lower() == 'true', host='0.0.0.0', port=port)

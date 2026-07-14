@@ -7,7 +7,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#b22222">
 <link rel="manifest" href="/static/manifest.json">
-<title>Anu Spirits — LCBO Tracker</title>
+<title>Dripp Tracker — Phoenix &amp; Dayaa at LCBO</title>
 <link rel="stylesheet" href="/static/style.css">
 <!-- Leaflet for the Map view (free OpenStreetMap tiles, no API key) -->
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
@@ -22,12 +22,12 @@
       <div class="brand-logo">
         <svg width="42" height="42" viewBox="0 0 42 42" fill="none">
           <rect width="42" height="42" rx="8" fill="#d4a574"/>
-          <text x="21" y="24" text-anchor="middle" fill="#b22222" font-size="16" font-weight="bold" font-family="serif">ANU</text>
-          <text x="21" y="34" text-anchor="middle" fill="#b22222" font-size="6" font-family="sans-serif">SPIRITS</text>
+          <text x="21" y="24" text-anchor="middle" fill="#b22222" font-size="12" font-weight="bold" font-family="serif">DRIPP</text>
+          <text x="21" y="34" text-anchor="middle" fill="#b22222" font-size="6" font-family="sans-serif">CANN SPIRITS</text>
         </svg>
         <div>
-          <h2>Anu Spirits</h2>
-          <span class="brand-sub">LCBO Tracker Pro</span>
+          <h2>Dripp Tracker</h2>
+          <span class="brand-sub">Phoenix &amp; Dayaa at LCBO</span>
         </div>
       </div>
     </div>
@@ -131,8 +131,8 @@
         <select id="cityFilter" onchange="currentPage=1;loadStores()"><option value="">All Cities</option></select>
         <select id="producerFilter" onchange="currentPage=1;loadStores()">
           <option value="">All Producers</option>
-          <option value="NB Distillers">NB Distillers</option>
-          <option value="Anu Portfolio">Anu Portfolio</option>
+          <option value="Phoenix">Phoenix</option>
+          <option value="Dayaa">Dayaa</option>
         </select>
       </div>
       <div class="card">
@@ -160,8 +160,8 @@
           <div class="form-group">
             <label>Producer(s) <span class="hint">select one or more</span></label>
             <div class="chip-group" id="producerChips">
-              <button class="chip" data-val="NB Distillers" onclick="toggleChip(this,'producer')">NB Distillers</button>
-              <button class="chip" data-val="Anu Portfolio" onclick="toggleChip(this,'producer')">Anu Portfolio</button>
+              <button class="chip" data-val="Phoenix" onclick="toggleChip(this,'producer')">Phoenix</button>
+              <button class="chip" data-val="Dayaa" onclick="toggleChip(this,'producer')">Dayaa</button>
             </div>
           </div>
           <div class="form-group">
@@ -214,12 +214,12 @@
         <h3>Add Product to Track</h3>
         <div class="form-row">
           <div class="form-group"><label>Brand</label>
-            <select id="newProdBrand"><option>NB Distillers</option><option>Anu Portfolio</option></select>
+            <select id="newProdBrand"><option>Phoenix</option><option>Dayaa</option></select>
           </div>
-          <div class="form-group"><label>Product Name</label><input type="text" id="newProdName" placeholder="e.g. Rutland Square Gin"></div>
+          <div class="form-group"><label>Product Name</label><input type="text" id="newProdName" placeholder="e.g. Phoenix Ultra Smooth Vodka"></div>
         </div>
         <div class="form-row">
-          <div class="form-group"><label>LCBO SKU</label><input type="text" id="newProdSku" placeholder="e.g. 46340"></div>
+          <div class="form-group"><label>LCBO SKU</label><input type="text" id="newProdSku" placeholder="e.g. 14318"></div>
           <div class="form-group"><label>Category</label>
             <select id="newProdCat"><option>Spirits</option><option>Wine</option><option>Beer</option></select>
           </div>
@@ -295,10 +295,10 @@
     <!-- ===== OPPORTUNITIES ===== -->
     <section id="view-opportunities" class="view">
       <div class="view-header">
-        <h1>NB Distillers Opportunities</h1>
+        <h1>Dripp Opportunities</h1>
         <div class="live-badge">TARGETS <span class="pulse"></span></div>
       </div>
-      <p class="view-desc">Stores with 0 or 1 NB Distillers products stocked. Priority targets for Red Admiral Vodka &amp; Chak De Whisky.</p>
+      <p class="view-desc">Stores with 0 or 1 Dripp products stocked. Priority targets for Phoenix Ultra Smooth Vodka &amp; Dayaa Arak.</p>
       <div class="opp-stats" id="oppStats"></div>
       <div class="card">
         <div class="opp-tabs">
@@ -378,7 +378,7 @@
         <h1>SOD Live &mdash; LCBO Daily Feed</h1>
         <div class="live-badge">LIVE <span class="pulse"></span></div>
       </div>
-      <p class="view-desc">Official LCBO Sale-of-Data feed &mdash; ingested nightly from <code>sod.lcbo.com</code>. Every SKU, every store, every day. Filtered to Anu &amp; NB Distillers products for reports.</p>
+      <p class="view-desc">Official LCBO Sale-of-Data feed &mdash; ingested nightly from <code>sod.lcbo.com</code>. Every SKU, every store, every day. Filtered to Dripp products (Phoenix &amp; Dayaa) for reports.</p>
       <div class="sod-status-grid" id="sodStatusGrid"></div>
       <div class="filters">
         <button class="btn-primary" onclick="triggerSodSync()" id="sodSyncBtn">&#128260; Sync Now (Daily A + B)</button>
@@ -422,7 +422,7 @@
       <div class="card" id="sodRecentRunsCard">
         <h3>Recent Sync Runs</h3>
         <table class="data-table" id="sodRunsTable">
-          <thead><tr><th>When</th><th>Source</th><th>File</th><th>Snapshot</th><th>Status</th><th>Rows</th><th>Anu Rows</th><th>+Listings</th><th>&ndash;Listings</th><th>Duration</th></tr></thead>
+          <thead><tr><th>When</th><th>Source</th><th>File</th><th>Snapshot</th><th>Status</th><th>Rows</th><th>Dripp Rows</th><th>+Listings</th><th>&ndash;Listings</th><th>Duration</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -492,7 +492,7 @@
       <div class="card" style="margin-top:20px">
         <h3>&#128279; Google Sheets Live Sync</h3>
         <p style="margin-bottom:12px">Paste in Google Sheets cell A1 — auto-refreshes hourly:</p>
-        <code class="code-block">=IMPORTDATA("https://lcbo-tracker.onrender.com/api/export/pipeline")</code>
+        <code class="code-block">=IMPORTDATA("https://drippcan-tracker.onrender.com/api/export/pipeline")</code>
       </div>
     </section>
 
@@ -626,7 +626,7 @@
             </select>
           </label>
           <label>Target key
-            <input type="text" id="goalKey" required placeholder="e.g. 0020187 / TOR_CORE / Rep Name">
+            <input type="text" id="goalKey" required placeholder="e.g. 0014318 / TOR_CORE / Rep Name">
           </label>
           <label>Period start <input type="date" id="goalStart" required></label>
           <label>Period end <input type="date" id="goalEnd" required></label>
@@ -684,7 +684,7 @@
               <option value="Top">Top</option>
             </select>
           </label>
-          <label>Products carried <input type="text" id="hProducts" placeholder="Red Admiral, Chak De"></label>
+          <label>Products carried <input type="text" id="hProducts" placeholder="Phoenix, Dayaa"></label>
           <label class="full-width">Notes <input type="text" id="hNotes"></label>
           <button type="submit" class="btn-primary">Add Account</button>
         </form>
@@ -768,7 +768,7 @@
               <div class="form-row">
                 <div class="form-group"><label>Postal</label><input type="text" id="editPostal"></div>
                 <div class="form-group"><label>Producer</label>
-                  <select id="editProducer"><option value="">--</option><option>NB Distillers</option><option>Anu Portfolio</option><option>Both</option></select>
+                  <select id="editProducer"><option value="">--</option><option>Phoenix</option><option>Dayaa</option><option>Both</option></select>
                 </div>
               </div>
               <div class="form-row">

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ===========================================================================
-# Anu LCBO Tracker — One-shot Fly.io deploy
+# Dripp Tracker — One-shot Fly.io deploy (reference alternative; Render is primary)
 # ===========================================================================
 #
 # Run this ONCE after `flyctl auth login`. It:
@@ -43,7 +43,7 @@ USER=$(flyctl auth whoami 2>&1 | head -1)
 echo "✓ Logged in as: $USER"
 echo ""
 
-APP_NAME="${APP_NAME:-lcbo-tracker}"
+APP_NAME="${APP_NAME:-drippcan-tracker}"
 REGION="${REGION:-yyz}"  # Toronto
 
 # Create the app if it doesn't exist
@@ -78,7 +78,7 @@ else
   echo "   flyctl secrets set ALERT_EMAIL_FROM=alerts@anuspirits.com -a $APP_NAME"
   echo "   flyctl secrets set TASTING_DIGEST_TO=ikshit@anuspirits.com,sales@anuspirits.com -a $APP_NAME"
   echo "   flyctl secrets set ADMIN_TOKEN=\$(openssl rand -hex 32) -a $APP_NAME"
-  echo "   flyctl secrets set CORS_ORIGINS=https://lcbo-tracker-web.vercel.app -a $APP_NAME"
+  echo "   flyctl secrets set CORS_ORIGINS=https://drippcan-web.vercel.app -a $APP_NAME"
 fi
 
 echo ""
@@ -109,13 +109,13 @@ echo "============================================================"
 echo "🔗 NEXT STEP — point Vercel at the new backend"
 echo "============================================================"
 echo ""
-echo "  1. https://vercel.com/dashboard → lcbo-tracker-web → Settings → Env Variables"
+echo "  1. https://vercel.com/dashboard → drippcan-web → Settings → Env Variables"
 echo "  2. Edit NEXT_PUBLIC_API_BASE for Production:"
-echo "       OLD: https://lcbo-tracker.onrender.com"
+echo "       OLD: https://drippcan-tracker.onrender.com"
 echo "       NEW: $URL"
 echo "  3. Deployments → click ⋯ on latest → Redeploy (without cache)"
-echo "  4. Wait ~90s, visit https://lcbo-tracker-web.vercel.app — now hitting Fly"
+echo "  4. Wait ~90s, visit https://drippcan-web.vercel.app — now hitting Fly"
 echo ""
 echo "  Once verified, you can suspend the Render service to stop the credit emails:"
-echo "  Render dashboard → lcbo-tracker → Settings → Suspend Service"
+echo "  Render dashboard → drippcan-tracker → Settings → Suspend Service"
 echo ""

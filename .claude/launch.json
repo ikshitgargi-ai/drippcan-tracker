@@ -2,11 +2,11 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "lcbo-tracker",
+      "name": "drippcan-tracker",
       "runtimeExecutable": "python3",
       "runtimeArgs": ["app.py"],
-      "port": 5050,
-      "cwd": "/Users/ikshitsharma/Desktop/copy/lcbo-tracker"
+      "port": 5070,
+      "cwd": "/Users/ikshitsharma/Desktop/copy/drippcan-tracker"
     }
   ]
 }

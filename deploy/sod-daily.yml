@@ -1,0 +1,70 @@
+# Dripp Tracker — scheduled wake + sync (replaces a Render cron: the free web
+# service sleeps, so GitHub Actions does the waking).
+#
+# Two schedules in one workflow:
+#   - 08:15 UTC daily        → wake the service, then POST /api/sod/cron
+#                              (daily LCBO Sale-of-Data ingest)
+#   - 13:00/17:00/21:00 UTC  → wake the service, then POST /api/live/refresh
+#                              (lcbo.com live-scrape safety net for the times
+#                              the free worker slept through APScheduler)
+#
+# Secrets required (repo Settings → Secrets and variables → Actions):
+#   SOD_CRON_TOKEN — must match the SOD_CRON_TOKEN env var on the Render service.
+#
+# NOTE: this file cannot be pushed with a git token lacking the `workflow`
+# scope — commit it via the GitHub web UI at deploy time.
+
+name: sod-daily
+
+on:
+  schedule:
+    - cron: '15 8 * * *'        # daily SOD ingest
+    - cron: '0 13,17,21 * * *'  # live lcbo.com refresh safety net
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Which job to run (sod / live / both)'
+        required: false
+        default: 'both'
+
+env:
+  BASE_URL: https://drippcan-tracker.onrender.com
+
+jobs:
+  sod-sync:
+    if: github.event.schedule == '15 8 * * *' || github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'sod' || github.event.inputs.job == 'both')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake the free-tier service (cold start ~50s)
+        run: |
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 90 "$BASE_URL/healthz" || true)
+            echo "wake attempt $i -> HTTP $code"
+            if [ "$code" = "200" ] || [ "$code" = "503" ]; then break; fi
+            sleep 20
+          done
+
+      - name: Trigger daily SOD ingest
+        run: |
+          curl -fsS -X POST --max-time 1800 \
+            -H "Authorization: Bearer ${{ secrets.SOD_CRON_TOKEN }}" \
+            "$BASE_URL/api/sod/cron"
+
+  live-refresh:
+    if: github.event.schedule == '0 13,17,21 * * *' || github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'live' || github.event.inputs.job == 'both')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake the free-tier service (cold start ~50s)
+        run: |
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 90 "$BASE_URL/healthz" || true)
+            echo "wake attempt $i -> HTTP $code"
+            if [ "$code" = "200" ] || [ "$code" = "503" ]; then break; fi
+            sleep 20
+          done
+
+      - name: Trigger live lcbo.com refresh
+        run: |
+          curl -fsS -X POST --max-time 300 \
+            -H "Authorization: Bearer ${{ secrets.SOD_CRON_TOKEN }}" \
+            "$BASE_URL/api/live/refresh"

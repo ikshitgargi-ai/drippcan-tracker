@@ -1,45 +1,40 @@
 services:
-  # Main Flask backend (Anu LCBO Tracker)
+  # Main Flask backend (Dripp Tracker — Phoenix & Dayaa at LCBO)
   - type: web
-    name: lcbo-tracker
+    name: drippcan-tracker
     runtime: python
     buildCommand: pip install -r requirements.txt
     # Long timeout for the Daily A SOD sync (1.5M rows can take ~22 min on free tier)
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 1800 --workers 1
-    plan: starter  # $7/mo: always-on (no cold starts), faster builds. 512MB RAM (sufficient w/ streaming parser).
+    # Free tier: cold-starts after ~15 min idle (~50s wake). Upgrade to
+    # plan: starter ($7/mo, always-on, no cold starts) once volume justifies it.
+    plan: free
     healthCheckPath: /healthz
     envVars:
       - key: FLASK_DEBUG
         value: "false"
       - key: DATABASE_URL
-        sync: false  # set in Render dashboard
+        sync: false  # set in Render dashboard — NEW Neon project 'drippcan', never another app's DB
       - key: SOD_USER
         sync: false
       - key: SOD_PASSWORD
         sync: false
       - key: SOD_AGENT_ID
-        sync: false
+        sync: false  # 1113
+      - key: ADMIN_TOKEN
+        sync: false  # fresh token — do not reuse another app's
       - key: SOD_CRON_TOKEN
-        sync: false  # used by the Cron Job below
+        sync: false  # used by the GitHub Action daily wake (.github/workflows/sod-daily.yml)
+      - key: OWNER_PASSCODE
+        sync: false  # gates the owner (brand) view — generate a strong one at deploy
+      - key: RESEND_API_KEY
+        sync: false  # email alerts + backup-to-email
       - key: SENTRY_DSN
         sync: false  # optional
       - key: CORS_ORIGINS
-        sync: false  # comma-separated; defaults work for Vercel + localhost
+        sync: false  # comma-separated; defaults cover drippcan-web.vercel.app + localhost:3002
 
-  # Daily SOD refresh cron — belt-and-suspenders to in-process APScheduler.
-  # Runs at 03:05 ET (05:05 UTC fall, 04:05 UTC summer — Render uses UTC for cron).
-  # Curls the protected /api/sod/cron endpoint; if the in-process scheduler already
-  # ran (last sync < 6h ago) the endpoint no-ops.
-  - type: cron
-    name: lcbo-sod-daily-cron
-    runtime: image
-    image:
-      url: docker.io/curlimages/curl:latest
-    schedule: "5 7 * * *"  # 07:05 UTC = 02:05 ET (winter) / 03:05 ET (summer-ish)
-    plan: starter
-    envVars:
-      - key: SOD_CRON_TOKEN
-        sync: false  # MUST match the SOD_CRON_TOKEN on the web service
-    dockerCommand: >
-      curl -fsS -X POST -H "Authorization: Bearer $SOD_CRON_TOKEN"
-      https://lcbo-tracker.onrender.com/api/sod/cron
+# NO Render cron block on purpose: the free tier sleeps, so the daily SOD sync
+# and live lcbo.com refresh are driven by a GitHub Action instead
+# (.github/workflows/sod-daily.yml — wakes the service and hits the protected
+# endpoints with the SOD_CRON_TOKEN bearer).

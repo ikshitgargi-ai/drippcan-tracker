@@ -1,4 +1,4 @@
-# LCBO Tracker — Flask backend
+# Dripp Tracker — Flask backend
 # Runs on Fly.io (default), Railway, or any container host.
 FROM python:3.11.11-slim
 

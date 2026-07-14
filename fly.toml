@@ -1,4 +1,6 @@
-# Fly.io config for LCBO Tracker (Anu Spirits CRM backend).
+# Fly.io config for Dripp Tracker (Phoenix & Dayaa at LCBO — backend).
+# NOTE: Render (render.yaml) is the primary deploy target; this file is a
+# kept-for-reference alternative.
 #
 # This replaces Render. Fly's free tier (shared-cpu-1x, 256MB) handles our load
 # (~10 RPS peak, 1.5M-row SOD ingest streamed in chunks). Always-on by default
@@ -10,9 +12,9 @@
 #          fly deploy
 #
 # After it's healthy, point the frontend at it via Vercel env:
-#   NEXT_PUBLIC_API_BASE=https://lcbo-tracker.fly.dev
+#   NEXT_PUBLIC_API_BASE=https://drippcan-tracker.fly.dev
 
-app = "lcbo-tracker"
+app = "drippcan-tracker"
 primary_region = "yyz"   # Toronto — closest to Neon (us-east) and our LCBO stores
 
 [build]

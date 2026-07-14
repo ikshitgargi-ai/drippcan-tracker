@@ -1,4 +1,4 @@
-/* ===== Anu Spirits LCBO Tracker Pro — Frontend Engine ===== */
+/* ===== Dripp Tracker — Frontend Engine ===== */
 
 let currentPage = 1;
 let activeRepId = null;
@@ -231,8 +231,8 @@ async function loadDashboard() {
     <div class="stat-card green"><div class="label">Activities Logged</div><div class="value">${d.total_activities}</div></div>
     <div class="stat-card blue"><div class="label">Active Stores</div><div class="value">${d.active_stores || 0}</div></div>
     <div class="stat-card orange"><div class="label">This Week</div><div class="value">${d.week_activities || 0}</div></div>
-    <div class="stat-card" style="border-left:3px solid #e17055"><div class="label">NB Distillers</div><div class="value" style="color:#e17055">${prods['NB Distillers'] || 0}</div></div>
-    <div class="stat-card" style="border-left:3px solid #00cec9"><div class="label">Anu Portfolio</div><div class="value" style="color:#00cec9">${prods['Anu Portfolio'] || 0}</div></div>
+    <div class="stat-card" style="border-left:3px solid #e17055"><div class="label">Phoenix</div><div class="value" style="color:#e17055">${prods['Phoenix'] || 0}</div></div>
+    <div class="stat-card" style="border-left:3px solid #00cec9"><div class="label">Dayaa</div><div class="value" style="color:#00cec9">${prods['Dayaa'] || 0}</div></div>
     <div class="stat-card red"><div class="label">Overdue Follow-Ups</div><div class="value">${d.overdue_followups || 0}</div></div>
     <div class="stat-card" style="border-left:3px solid var(--accent)"><div class="label">Untouched Stores</div><div class="value" style="color:var(--accent-light)">${d.total_stores - (d.active_stores || 0)}</div></div>
   `;
@@ -637,7 +637,7 @@ async function loadInventory() {
   }
 
   grid.innerHTML = products.map(p => `
-    <div class="inventory-card ${p.brand === 'NB Distillers' ? 'inv-nb' : 'inv-anu'}">
+    <div class="inventory-card ${p.brand === 'Phoenix' ? 'inv-nb' : 'inv-anu'}">
       <div class="inv-header">
         <div>
           <div class="inv-brand">${esc(p.brand)}</div>
@@ -1088,7 +1088,7 @@ async function loadSodStatus() {
       <div class="stat-card">
         <div class="stat-label">Tracked Products</div>
         <div class="stat-value">${tracked}</div>
-        <div class="stat-sub">Anu &amp; NB Distillers</div>
+        <div class="stat-sub">Phoenix &amp; Dayaa</div>
       </div>
     `;
     // Recent runs table
