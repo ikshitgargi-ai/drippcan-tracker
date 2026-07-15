@@ -710,6 +710,21 @@ def close_db(exception):
         db.close()
 
 
+def _in_app_context(fn):
+    """Wrap a scheduled callable so it runs inside a Flask app context.
+    APScheduler jobs execute in bare worker threads with NO app context, so any
+    job that reaches get_db()/db_fetchall() (Flask `g`) would raise
+    'Working outside of application context' and be silently swallowed — which
+    is how the daily backup / health / digest jobs were dying. The
+    teardown_appcontext above closes the pooled connection on block exit, so
+    this is leak-free."""
+    def _wrapped(*args, **kwargs):
+        with app.app_context():
+            return fn(*args, **kwargs)
+    _wrapped.__name__ = getattr(fn, '__name__', 'scheduled_job')
+    return _wrapped
+
+
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371
     dlat = math.radians(lat2 - lat1)
@@ -6299,7 +6314,7 @@ def start_health_scheduler():
                 except Exception:
                     pass
         sched.add_job(
-            _run,
+            _in_app_context(_run),
             CronTrigger(hour=6, minute=0),  # 06:00 ET — after SOD sync at 03:00
             id='daily_health_check',
             replace_existing=True,
@@ -6309,7 +6324,7 @@ def start_health_scheduler():
         )
         # Also run mid-day sanity check at 14:00 ET
         sched.add_job(
-            _run,
+            _in_app_context(_run),
             CronTrigger(hour=14, minute=0),
             id='midday_health_check',
             replace_existing=True,
@@ -6360,7 +6375,7 @@ def start_health_scheduler():
                 print(f"[stale-watch] error: {e}")
 
         sched.add_job(
-            _stale_watch,
+            _in_app_context(_stale_watch),
             CronTrigger(minute=15),  # every hour at :15
             id='hourly_stale_watch',
             replace_existing=True,
@@ -13596,7 +13611,7 @@ def start_backup_scheduler():
                     pass
 
         sched.add_job(
-            _run_backup,
+            _in_app_context(_run_backup),
             CronTrigger(hour=2, minute=0),  # 02:00 ET
             id='daily_backup',
             replace_existing=True,
@@ -14000,7 +14015,7 @@ def start_tasting_digest_scheduler():
             sched = BackgroundScheduler()
 
         sched.add_job(
-            lambda: _send_tasting_digest_email('tomorrow'),
+            _in_app_context(lambda: _send_tasting_digest_email('tomorrow')),
             CronTrigger(hour=6, minute=30),  # 06:30 ET — after morning health check
             id='daily_tasting_digest',
             replace_existing=True,
