@@ -5,7 +5,7 @@ services:
     runtime: python
     buildCommand: pip install -r requirements.txt
     # Long timeout for the Daily A SOD sync (1.5M rows can take ~22 min on free tier)
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 1800 --workers 1
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 1800 --workers 1 --threads 8
     # Free tier: cold-starts after ~15 min idle (~50s wake). Upgrade to
     # plan: starter ($7/mo, always-on, no cold starts) once volume justifies it.
     plan: starter  # $7/mo always-on (founder-approved 2026-07-14)
