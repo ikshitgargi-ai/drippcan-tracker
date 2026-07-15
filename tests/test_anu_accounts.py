@@ -250,3 +250,39 @@ class TestBillableDedup:
         assert r['billable_listings'] == 1, f"double-counted: {r['billable_listings']}"
         assert len(r['listings']) == 1  # one row per store×SKU
         assert 'sod' in r['listings'][0]['source'] and 'live' in r['listings'][0]['source']
+
+
+class TestBillingDefinition:
+    """Locks the billing rule: ONE billable listing = ONE new SKU newly listed
+    at ONE store we touched (per new store, per SKU#), counted once regardless
+    of how many sources saw it."""
+    def test_two_new_skus_at_one_store_bill_two(self, seeded, client, app_module):
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
+                       "VALUES (?,?,?)", (960, 'Def Two SKUs', 'Toronto'))
+            db.commit()
+        _log(client, 960, 'store_visit', visit_date='2026-07-16')
+        with app_module.app.app_context():
+            db = app_module.get_db(); cur = db.cursor()
+            # two DIFFERENT SKUs newly listed after our touch
+            app_module._ledger_record(cur, PHOENIX, 960, 'LISTED', 'sod', 'x', '2026-07-18')
+            app_module._ledger_record(cur, DAYAA, 960, 'LISTED', 'live', 'x', '2026-07-19')
+            db.commit()
+        r = next(x for x in _accounts(client)['rows'] if x['store_number'] == 960)
+        assert r['billable_listings'] == 2      # one per SKU
+
+    def test_one_sku_two_sources_bills_one(self, seeded, client, app_module):
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
+                       "VALUES (?,?,?)", (961, 'Def One SKU', 'Toronto'))
+            db.commit()
+        _log(client, 961, 'store_visit', visit_date='2026-07-16')
+        with app_module.app.app_context():
+            db = app_module.get_db(); cur = db.cursor()
+            app_module._ledger_record(cur, PHOENIX, 961, 'LISTED', 'sod', 'x', '2026-07-18')
+            app_module._ledger_record(cur, PHOENIX, 961, 'LISTED', 'live', 'x', '2026-07-19')
+            db.commit()
+        r = next(x for x in _accounts(client)['rows'] if x['store_number'] == 961)
+        assert r['billable_listings'] == 1      # same store×SKU = one listing
