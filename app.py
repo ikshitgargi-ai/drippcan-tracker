@@ -7874,6 +7874,9 @@ _EXPORT_TABLES = [
     # is the derived fold, exported alongside so a restore is instant.
     ('listing_ledger',             'id'),
     ('store_listings',             'id'),
+    # The touched-store billing ledger: the claim record Kevin pays against.
+    # Loses money if lost — it rides the daily backup and is restore-protected.
+    ('anu_accounts',               'store_number'),
     # Optional (large)
     ('sod_inventory',              None),  # 1M+ rows, only included with ?include=all
     ('inventory_history',          None),
@@ -7891,7 +7894,7 @@ _RETENTION_PROTECTED_TABLES = frozenset((
     # rebuild owns it), but protecting it keeps a restore from wiping it before
     # a rebuild runs; the rebuild's controlled DELETE stays the only way it's
     # cleared, and that path is not one of the hard-delete grep targets.
-    'listing_ledger', 'store_listings',
+    'listing_ledger', 'store_listings', 'anu_accounts',
 ))
 
 
