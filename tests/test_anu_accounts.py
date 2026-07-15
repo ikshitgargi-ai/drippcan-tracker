@@ -29,6 +29,7 @@ TEST_DB = os.path.join(TEST_DB_DIR, 'drippcan.db')
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 PHOENIX = '0014318'
+DAYAA = '0044451'
 APP_PY = os.path.join(os.path.dirname(__file__), '..', 'app.py')
 
 
@@ -122,11 +123,13 @@ class TestBillingClassification:
         with app_module.app.app_context():
             db = app_module.get_db()
             cur = db.cursor()
-            # Baseline: listed before/at launch (2026-07-15).
+            # Baseline: PHOENIX listed before/at launch (2026-07-15).
             app_module._ledger_record(cur, PHOENIX, 901, 'LISTED', 'sod',
                                       'test', '2026-07-13')
-            # Billable: NEW listing after our 901 claim (claim is today).
-            app_module._ledger_record(cur, PHOENIX, 901, 'LISTED', 'live',
+            # Billable: a DIFFERENT SKU (Dayaa) newly listed after our claim.
+            # (Same-SKU re-listing collapses to its earliest date by design —
+            # a SKU already listed at baseline is never re-billed.)
+            app_module._ledger_record(cur, DAYAA, 901, 'LISTED', 'live',
                                       'test', '2099-01-01')
             # listed_before_touch: new listing on a store we touched later.
             db.execute(
@@ -197,3 +200,53 @@ class TestSelfHeal:
         row = next(r for r in body['rows'] if r['store_number'] == 904)
         assert row['account_ref'] == 'ANU-904'
         assert row['first_touch_type'] == 'call'
+
+
+class TestOwnerLedgerLeak:
+    def test_listings_added_strips_note_and_source_detail(self, seeded, client, app_module):
+        # A rep-sourced LISTED ledger row carries the rep name in source_detail.
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            cur = db.cursor()
+            app_module._ledger_record(cur, PHOENIX, 901, 'LISTED', 'rep',
+                                      'Ikshit', '2026-07-20', note='saw 6 on shelf, Vaneet tip')
+            db.commit()
+        # internal view: rep detail visible
+        internal = client.get('/api/listings/added?days=3650&nocache=1').get_json()
+        rows = internal if isinstance(internal, list) else internal.get('rows', internal.get('added', []))
+        # owner view: no rep name, no note, no source_detail
+        owner = client.get('/api/listings/added?days=3650&nocache=1',
+                           headers={'X-View': 'owner'})
+        dump = owner.get_data(as_text=True)
+        for name in ('Ikshit', 'Vaneet', 'Namit'):
+            assert name not in dump, f'{name} leaked to owner via listings/added'
+
+    def test_anu_accounts_reps_are_gta_labels(self, seeded, client):
+        body = client.get('/api/anu-accounts?nocache=1', headers={'X-View': 'owner'}).get_json()
+        for r in body['rows']:
+            for rep in r.get('reps', []):
+                assert 'GTA' in rep, f'raw rep name leaked: {rep}'
+
+
+class TestBillableDedup:
+    def test_same_store_sku_two_sources_bills_once(self, seeded, client, app_module):
+        # Store 950 touched today; the SAME SKU listed via BOTH sod and live
+        # after launch — must count as ONE billable listing, not two.
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            cur = db.cursor()
+            db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
+                       "VALUES (?,?,?)", (950, 'Dedup Test', 'Toronto'))
+            db.commit()
+        _log(client, 950, 'store_visit', visit_date='2026-07-16')
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            cur = db.cursor()
+            app_module._ledger_record(cur, PHOENIX, 950, 'LISTED', 'sod', 'x', '2026-07-18')
+            app_module._ledger_record(cur, PHOENIX, 950, 'LISTED', 'live', 'x', '2026-07-19')
+            db.commit()
+        body = _accounts(client)
+        r = next(x for x in body['rows'] if x['store_number'] == 950)
+        assert r['billable_listings'] == 1, f"double-counted: {r['billable_listings']}"
+        assert len(r['listings']) == 1  # one row per store×SKU
+        assert 'sod' in r['listings'][0]['source'] and 'live' in r['listings'][0]['source']

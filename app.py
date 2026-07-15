@@ -368,6 +368,10 @@ def require_app_origin(fn):
 # Keys whose VALUES are internal notes / contact identity — blanked for owner.
 OWNER_STRIP_KEYS = frozenset((
     'notes', 'store_notes', 'last_note',
+    # Singular 'note' and 'source_detail' ride the canonical ledger: a
+    # rep-sourced LISTED row carries the rep's name in source_detail and can
+    # carry competitor/free-text in note. The owner must see neither.
+    'note', 'source_detail',
     'manager_name', 'asst_manager_name', 'manager_phone', 'store_email',
     'spirits_ambassador', 'contacts', 'phone', 'email',
 ))
@@ -375,6 +379,9 @@ OWNER_STRIP_KEYS = frozenset((
 OWNER_REP_KEYS = frozenset((
     'rep', 'rep_name', 'changed_by', 'added_by', 'updated_by', 'observed_by',
 ))
+# Keys whose value is a LIST of rep identities — each element GTA-labeled and
+# de-duplicated, so a plural 'reps' array can never leak a raw name.
+OWNER_REP_LIST_KEYS = frozenset(('reps',))
 # Actor labels that are NOT rep identities — kept verbatim in owner view.
 _OWNER_NEUTRAL_ACTORS = frozenset((
     'owner', 'rep', 'admin', 'system', 'seed', 'seed-default', 'discovery',
@@ -440,6 +447,10 @@ def _owner_sanitize(obj):
             lk = str(k).lower()
             if lk in OWNER_STRIP_KEYS:
                 out[k] = ''
+            elif lk in OWNER_REP_LIST_KEYS and isinstance(v, list):
+                # Map each rep to its GTA label directly (never rely on the
+                # free-text regex catching the name), then de-dup.
+                out[k] = sorted({_owner_region_label(x) for x in v if x})
             elif lk in OWNER_REP_KEYS:
                 if not v or str(v).strip().lower() in _OWNER_NEUTRAL_ACTORS:
                     out[k] = v
@@ -4661,10 +4672,18 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
             for store, new_st in current_per_store.items():
                 old_st = prior_per_store.get(store)
                 if old_st is None:
-                    # Store newly carrying this SKU
-                    store_change_inserts.append(
-                        (tracked_sku, store, snapshot_date, None, new_st, 'NEW_LISTING'),
-                    )
+                    # Store newly carrying this SKU. Only status 'L' is a real
+                    # listing; a first appearance already delisted ('D'/'F')
+                    # must NOT fold as LISTED (it would be billed as a placement
+                    # that never existed).
+                    if new_st == 'L':
+                        store_change_inserts.append(
+                            (tracked_sku, store, snapshot_date, None, new_st, 'NEW_LISTING'),
+                        )
+                    else:
+                        store_change_inserts.append(
+                            (tracked_sku, store, snapshot_date, None, new_st, 'DELISTED'),
+                        )
                 elif old_st != new_st:
                     if new_st == 'L' and old_st in ('D', 'F'):
                         store_change_inserts.append(
@@ -24032,11 +24051,27 @@ def api_anu_accounts():
     ledger = db_fetchall(
         "SELECT store_number, sku, source, observed_date FROM listing_ledger "
         "WHERE event = 'LISTED' ORDER BY observed_date")
-    listings_by_store = {}
+    # Collapse to ONE listing per store×SKU (a listing is a store×SKU placement,
+    # and Kevin pays per listing — NOT per ledger row). The earliest observed
+    # date across sources is the best proxy for when the listing was created;
+    # counting each ledger row would double-bill a store listed via both SOD
+    # and lcbo.com, or after any relist.
+    _by_store_sku = {}
     for sn, sku, source, odate in ledger:
-        listings_by_store.setdefault(sn, []).append(
-            {'sku': sku, 'brand': SOD_TRACKED_SKUS.get(sku, ('', ''))[0],
-             'source': source, 'date': str(odate or '')})
+        d = str(odate or '')
+        m = _by_store_sku.setdefault(sn, {})
+        cur_ev = m.get(sku)
+        if cur_ev is None:
+            m[sku] = {'sku': sku, 'brand': SOD_TRACKED_SKUS.get(sku, ('', ''))[0],
+                      'date': d, 'sources': {source}}
+        else:
+            cur_ev['sources'].add(source)
+            if d and (not cur_ev['date'] or d < cur_ev['date']):
+                cur_ev['date'] = d
+    listings_by_store = {
+        sn: sorted(m.values(), key=lambda e: (e['brand'], e['sku']))
+        for sn, m in _by_store_sku.items()
+    }
 
     statuses = {r[0]: {'owner_status': r[1] or 'none',
                        'owner_status_updated_at': str(r[2] or '')}
@@ -24056,8 +24091,11 @@ def api_anu_accounts():
         billable = 0
         for ev in listings_by_store.get(sn, []):
             cls = _anu_listing_class(ev['date'], claim)
-            listings.append({**ev, 'classification': cls})
-            if cls == 'billable':
+            listings.append({
+                'sku': ev['sku'], 'brand': ev['brand'], 'date': ev['date'],
+                'source': ','.join(sorted(ev['sources'])),
+                'classification': cls})
+            if cls == 'billable':      # one count per store×SKU, never per row
                 billable += 1
         total_billable += billable
         if billable:
