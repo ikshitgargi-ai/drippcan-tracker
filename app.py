@@ -507,6 +507,11 @@ _OWNER_ALLOWED_PATHS = {
     '/api/top100/import-xlsx': frozenset(('POST',)),
     '/api/changes': frozenset(('GET', 'HEAD')),
     '/api/conversion': frozenset(('GET', 'HEAD')),
+    # Anu Accounts: the touched-store billing ledger — the owner VERIFIES the
+    # touch → listing → order chain here before paying per-listing fees.
+    # Rep identities ride through @owner_scope as GTA region labels.
+    '/api/anu-accounts': frozenset(('GET', 'HEAD')),
+    '/api/export/anu-accounts.xlsx': frozenset(('GET', 'HEAD')),
     '/api/reconcile': frozenset(('GET', 'HEAD')),
     '/api/crm/oos-risk': frozenset(('GET', 'HEAD')),
     '/api/crm/dashboard': frozenset(('GET', 'HEAD')),
@@ -2355,6 +2360,22 @@ def api_activity_create():
         db_commit()
         last = db_fetchone("SELECT last_insert_rowid() as id")
         new_id = last['id'] if isinstance(last, dict) else last[0]
+
+    # ANU ACCOUNTS: a logged touch permanently names this store to Anu.
+    # Best-effort — a miss self-heals via the backfill in _ensure_anu_accounts.
+    try:
+        _db_claim = get_db()
+        _ensure_anu_accounts(_db_claim)
+        _snrow = db_fetchone("SELECT store_number FROM stores WHERE id = ?",
+                             [store_id])
+        _sn = (_snrow['store_number'] if isinstance(_snrow, dict)
+               else _snrow[0]) if _snrow else None
+        if _sn:
+            _claim_anu_account(_db_claim, _sn, new_id, activity_type,
+                               _anu_touch_at(None, datetime.now()))
+            _db_claim.commit()
+    except Exception as _ce:
+        print(f'[ANU-ACCOUNTS] claim skipped (self-heals on backfill): {_ce}')
 
     # Create persistent follow-up record if date set
     if follow_up_date:
@@ -19296,6 +19317,23 @@ def api_crm_activities_create():
     except Exception:
         pass
 
+    # ANU ACCOUNTS: a logged touch permanently names this store to Anu.
+    # Best-effort — a miss self-heals via the backfill in _ensure_anu_accounts.
+    try:
+        _sn_claim = store_number
+        if not _sn_claim and store_id:
+            _r = db_fetchall(
+                f"SELECT store_number FROM stores WHERE id = "
+                f"{'%s' if USE_POSTGRES else '?'}", (store_id,))
+            _sn_claim = _r[0][0] if _r else None
+        if _sn_claim:
+            _ensure_anu_accounts(db)
+            _claim_anu_account(db, _sn_claim, activity_id, activity_type,
+                               _anu_touch_at(visit_date, datetime.now()))
+            db.commit()
+    except Exception as _ce:
+        print(f'[ANU-ACCOUNTS] claim skipped (self-heals on backfill): {_ce}')
+
     # Per-SKU outcomes → activity_sku_outcomes rows
     sku_outcomes = d.get('sku_outcomes') or []
     for so in sku_outcomes:
@@ -23838,6 +23876,229 @@ def api_export_territory_xlsx():
         rows.append(row)
     return _xlsx_response(f'dripp_territory_{_toronto_today().isoformat()}.xlsx',
                           'Territory', headers, rows)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ANU ACCOUNTS — the permanent touched-store ledger (the billing basis).
+# The moment a rep touches a store (visit / call / tasting / any logged
+# activity) the store is named an Anu Spirits account, permanently, with a
+# stable billing reference (ANU-<store#>). The owner verifies the evidence
+# chain before paying a per-listing fee:
+#     touchpoint (date + type) → listing (canonical listing_ledger) → order.
+# Claims only ever move EARLIER (a backdated visit strengthens a claim;
+# nothing weakens one). Rows are never deleted. Missed hook writes are
+# self-healing: the ensure step re-backfills from activities on every boot.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_ANU_ACCOUNTS_READY = False
+
+
+def _anu_touch_at(visit_date, created_at):
+    """Best timestamp for a touch: the backdated visit_date if present."""
+    v = str(visit_date or '').strip()
+    if v and v.lower() != 'none':
+        return v if len(v) > 10 else v + ' 00:00:00'
+    return str(created_at or '')
+
+
+def _claim_anu_account(db, store_number, activity_id, activity_type,
+                       touch_at, source='activity'):
+    """Idempotent permanent claim. Moves claimed_at earlier, never later."""
+    try:
+        store_number = int(store_number)
+    except (TypeError, ValueError):
+        return False
+    touch_at = str(touch_at or '').strip()
+    if not touch_at:
+        return False
+    ph = '%s' if USE_POSTGRES else '?'
+    cur = db.cursor() if USE_POSTGRES else db
+    cur.execute(
+        f"INSERT INTO anu_accounts (store_number, account_ref, claimed_at, "
+        f"first_touch_type, first_activity_id, source) "
+        f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph}) "
+        f"ON CONFLICT (store_number) DO UPDATE SET "
+        f"claimed_at=excluded.claimed_at, "
+        f"first_touch_type=excluded.first_touch_type, "
+        f"first_activity_id=excluded.first_activity_id, "
+        f"source=excluded.source "
+        f"WHERE excluded.claimed_at < anu_accounts.claimed_at",
+        (store_number, f'ANU-{store_number}', touch_at,
+         (activity_type or '').strip(), activity_id, source))
+    if USE_POSTGRES:
+        cur.close()
+    return True
+
+
+def _ensure_anu_accounts(db):
+    """Idempotent DDL + full backfill from every historical activity
+    (earliest touch wins). Cheap enough to run once per process."""
+    global _ANU_ACCOUNTS_READY
+    if _ANU_ACCOUNTS_READY:
+        return
+    ddl = ('CREATE TABLE IF NOT EXISTS anu_accounts ('
+           'store_number INTEGER PRIMARY KEY, '
+           "account_ref TEXT NOT NULL DEFAULT '', "
+           'claimed_at TIMESTAMP, '
+           "first_touch_type TEXT DEFAULT '', "
+           'first_activity_id INTEGER, '
+           "source TEXT DEFAULT 'activity', "
+           'created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)')
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute(ddl)
+        db.commit()
+        cur.close()
+    else:
+        db.execute(ddl)
+        db.commit()
+    hist = db_fetchall(
+        "SELECT s.store_number, a.id, a.activity_type, a.visit_date, "
+        "a.created_at FROM activities a JOIN stores s ON s.id = a.store_id "
+        "WHERE a.deleted_at IS NULL")
+    for r in hist:
+        _claim_anu_account(db, r[0], r[1], r[2], _anu_touch_at(r[3], r[4]),
+                           source='backfill')
+    db.commit()
+    _ANU_ACCOUNTS_READY = True
+
+
+def _anu_listing_class(listing_date, claim_date):
+    """Classify a LISTED ledger event against the claim, for billing:
+    baseline (existed at launch), billable (new listing on/after our touch),
+    listed_before_touch (new listing but our first touch came later)."""
+    if not listing_date:
+        return 'baseline'
+    if str(listing_date) <= LAUNCH_DATE:
+        return 'baseline'
+    if claim_date and str(claim_date)[:10] <= str(listing_date):
+        return 'billable'
+    return 'listed_before_touch'
+
+
+@app.route('/api/anu-accounts', methods=['GET'])
+@owner_scope
+def api_anu_accounts():
+    """Every store touched by the field team, from the first log forever:
+    the account list that names orders to Anu Spirits, with the verifiable
+    touch → listing → order chain per store."""
+    db = get_db()
+    _ensure_anu_accounts(db)
+
+    accounts = db_fetchall(
+        "SELECT a.store_number, a.account_ref, a.claimed_at, "
+        "a.first_touch_type, COALESCE(s.account,''), COALESCE(s.city,'') "
+        "FROM anu_accounts a LEFT JOIN stores s "
+        "ON s.store_number = a.store_number ORDER BY a.claimed_at")
+
+    tstats = db_fetchall(
+        "SELECT s.store_number, a.activity_type, COUNT(*), MAX(a.created_at) "
+        "FROM activities a JOIN stores s ON s.id = a.store_id "
+        "WHERE a.deleted_at IS NULL "
+        "GROUP BY s.store_number, a.activity_type")
+    touches = {}
+    for sn, atype, n, last in tstats:
+        t = touches.setdefault(sn, {'by_type': {}, 'total': 0, 'last': ''})
+        t['by_type'][atype] = n
+        t['total'] += n
+        t['last'] = max(t['last'], str(last or ''))
+
+    treps = db_fetchall(
+        "SELECT DISTINCT s.store_number, r.name FROM activities a "
+        "JOIN stores s ON s.id = a.store_id JOIN reps r ON r.id = a.rep_id "
+        "WHERE a.deleted_at IS NULL")
+    reps_by_store = {}
+    for sn, name in treps:
+        reps_by_store.setdefault(sn, []).append(name)
+
+    ledger = db_fetchall(
+        "SELECT store_number, sku, source, observed_date FROM listing_ledger "
+        "WHERE event = 'LISTED' ORDER BY observed_date")
+    listings_by_store = {}
+    for sn, sku, source, odate in ledger:
+        listings_by_store.setdefault(sn, []).append(
+            {'sku': sku, 'brand': SOD_TRACKED_SKUS.get(sku, ('', ''))[0],
+             'source': source, 'date': str(odate or '')})
+
+    statuses = {r[0]: {'owner_status': r[1] or 'none',
+                       'owner_status_updated_at': str(r[2] or '')}
+                for r in db_fetchall(
+                    "SELECT store_number, owner_status, "
+                    "owner_status_updated_at FROM territory_stores "
+                    "WHERE owner_status IS NOT NULL "
+                    "AND owner_status != 'none'")}
+
+    rows = []
+    total_billable = 0
+    with_billable = with_order = 0
+    for sn, ref, claimed_at, ftype, account, city in accounts:
+        claim = str(claimed_at or '')
+        t = touches.get(sn, {'by_type': {}, 'total': 0, 'last': ''})
+        listings = []
+        billable = 0
+        for ev in listings_by_store.get(sn, []):
+            cls = _anu_listing_class(ev['date'], claim)
+            listings.append({**ev, 'classification': cls})
+            if cls == 'billable':
+                billable += 1
+        total_billable += billable
+        if billable:
+            with_billable += 1
+        st = statuses.get(sn, {'owner_status': 'none',
+                               'owner_status_updated_at': ''})
+        order_touches = sum(n for k, n in t['by_type'].items()
+                            if 'order' in (k or '').lower())
+        has_order = bool(order_touches) or \
+            st['owner_status'] in ('order_received', 'completed')
+        if has_order:
+            with_order += 1
+        rows.append({
+            'store_number': sn, 'account_ref': ref, 'account': account,
+            'city': city, 'claimed_at': claim,
+            'first_touch_type': ftype,
+            'touches': t['by_type'], 'touches_total': t['total'],
+            'last_touch': t['last'],
+            'reps': sorted(reps_by_store.get(sn, [])),
+            'listings': listings, 'billable_listings': billable,
+            'owner_status': st['owner_status'],
+            'owner_status_updated_at': st['owner_status_updated_at'],
+            'order_evidence': {'order_activities': order_touches,
+                               'owner_status_order': st['owner_status'] in
+                               ('order_received', 'completed')},
+        })
+
+    return jsonify({
+        'launch_date': LAUNCH_DATE,
+        'summary': {
+            'accounts': len(rows),
+            'billable_listings': total_billable,
+            'accounts_with_billable_listing': with_billable,
+            'accounts_with_order_evidence': with_order,
+        },
+        'rows': rows,
+    })
+
+
+@app.route('/api/export/anu-accounts.xlsx')
+def api_export_anu_accounts_xlsx():
+    data = _api_json('api_anu_accounts')
+    headers = ['Account Ref', 'Store #', 'Account', 'City',
+               'Named to Anu Since', 'First Touch', 'Touches', 'Last Touch',
+               'Billable Listings', 'Listing Detail', 'Owner Status',
+               'Order Activities']
+    def _ld(r):
+        return '; '.join(
+            f"{x.get('brand') or x.get('sku')} {x.get('date')} "
+            f"({x.get('classification')})" for x in r.get('listings', []))
+    rows = [[r.get('account_ref'), r.get('store_number'), r.get('account'),
+             r.get('city'), r.get('claimed_at'), r.get('first_touch_type'),
+             r.get('touches_total'), r.get('last_touch'),
+             r.get('billable_listings'), _ld(r), r.get('owner_status'),
+             (r.get('order_evidence') or {}).get('order_activities', 0)]
+            for r in data.get('rows', [])]
+    return _xlsx_response(
+        f'anu_accounts_{_toronto_today().isoformat()}.xlsx',
+        'Anu Accounts', headers, rows)
 
 
 @app.route('/api/export/changes.xlsx')
