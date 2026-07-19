@@ -1,4 +1,4 @@
-/* ===== Dripp Tracker - Frontend Engine ===== */
+/* ===== drippCAN - Frontend Engine ===== */
 
 let currentPage = 1;
 let activeRepId = null;

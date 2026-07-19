@@ -1,11 +1,11 @@
 {
-  "name": "Dripp Tracker",
-  "short_name": "Dripp Tracker",
+  "name": "drippCAN",
+  "short_name": "drippCAN",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#060c18",
   "theme_color": "#060c18",
-  "description": "Dripp Tracker: Phoenix & Dayaa at LCBO: store visits, tastings, listings, calls and emails",
+  "description": "drippCAN: Phoenix & Dayaa at LCBO: store visits, tastings, listings, calls and emails",
   "icons": [
     {
       "src": "/static/icon-192.png",
