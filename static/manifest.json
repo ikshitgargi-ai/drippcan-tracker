@@ -3,9 +3,9 @@
   "short_name": "Dripp Tracker",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#0f1117",
-  "theme_color": "#6c5ce7",
-  "description": "Dripp Tracker — Phoenix & Dayaa at LCBO: store visits, tastings, listings, calls and emails",
+  "background_color": "#060c18",
+  "theme_color": "#060c18",
+  "description": "Dripp Tracker: Phoenix & Dayaa at LCBO: store visits, tastings, listings, calls and emails",
   "icons": [
     {
       "src": "/static/icon-192.png",
