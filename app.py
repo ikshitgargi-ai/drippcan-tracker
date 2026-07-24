@@ -24018,6 +24018,127 @@ def _anu_listing_class(listing_date, claim_date):
     return 'listed_before_touch'
 
 
+def _stock_on(db, store_number, sku, on_date):
+    """On-hand at a store×SKU as of a date: the most recent SOD snapshot on
+    or before that date. Returns (on_hand, status, snapshot_date) or
+    (None, None, None) when the store×SKU had no SOD row yet at all, which
+    is itself meaningful: the LCBO was not carrying it."""
+    rows = db_fetchall(
+        "SELECT on_hand, status, CAST(snapshot_date AS TEXT) "
+        "FROM sod_inventory WHERE store_number = ? AND sku = ? "
+        "AND CAST(snapshot_date AS TEXT) <= ? "
+        "ORDER BY snapshot_date DESC LIMIT 1",
+        [store_number, sku, str(on_date)[:10]])
+    if not rows:
+        return (None, None, None)
+    r = rows[0]
+    return (int(r[0] or 0), r[1], str(r[2]))
+
+
+def _journey_stage(stock_at_touch, listed_at_touch, stock_now, listed_now):
+    """The founder's refinement of the billing rule: what matters is the state
+    of the shelf WHEN WE TOUCHED IT. A store that was dry at the touch and now
+    holds bottles is a conversion we caused; a store that already had stock
+    was never ours to claim.
+
+    Stages:
+      already_stocked  - had bottles when we arrived. Not ours, full stop.
+      converted        - dry (or absent) at touch, bottles on the shelf now.
+      listed_no_stock  - authorised since the touch but no bottles yet. The
+                         order is the missing step; watch it.
+      still_dry        - dry at touch, dry now, no movement. Keep working it.
+    """
+    had_stock_then = (stock_at_touch or 0) > 0
+    has_stock_now = (stock_now or 0) > 0
+    if had_stock_then:
+        return 'already_stocked'
+    if has_stock_now:
+        return 'converted'
+    if listed_now and not listed_at_touch:
+        return 'listed_no_stock'
+    if listed_now:
+        return 'listed_no_stock'
+    return 'still_dry'
+
+
+@app.route('/api/anu-accounts/journey', methods=['GET'])
+@owner_scope
+def api_anu_accounts_journey():
+    """Touch -> listed -> ordered -> stock landed, per claimed store x SKU.
+
+    This is the STOCK-AWARE view of attribution. The invoice number in
+    /api/anu-accounts is unchanged and still follows the agreed rule (a new
+    listing dated on or after our first touch). This endpoint answers the
+    different question the founder asked: was the shelf EMPTY when Namit
+    touched it, and did bottles land afterwards?
+
+    Both numbers are reported side by side on purpose. They can disagree, and
+    when they do that is a conversation to have with the client openly, not a
+    silent change to what gets billed.
+    """
+    db = get_db()
+    _ensure_anu_accounts(db)
+    accounts = db_fetchall(
+        "SELECT a.store_number, a.claimed_at, a.first_touch_type, "
+        "COALESCE(s.account,''), COALESCE(s.city,''), COALESCE(s.address,'') "
+        "FROM anu_accounts a LEFT JOIN stores s "
+        "ON s.store_number = a.store_number ORDER BY a.claimed_at")
+    latest = db_fetchone("SELECT MAX(snapshot_date) AS d FROM sod_inventory")
+    latest_date = (latest['d'] if isinstance(latest, dict) else latest[0]) if latest else None
+
+    rows = []
+    tally = {'already_stocked': 0, 'converted': 0, 'listed_no_stock': 0,
+             'still_dry': 0}
+    for sn, claimed_at, ftype, account, city, address in accounts:
+        claim = str(claimed_at or '')[:10]
+        for sku in sorted(SOD_TRACKED_SKUS):
+            s_then, st_then, snap_then = _stock_on(db, sn, sku, claim)
+            s_now, st_now, snap_now = _stock_on(db, sn, sku, latest_date) \
+                if latest_date else (None, None, None)
+            listed_then = (st_then == 'L')
+            listed_now = (st_now == 'L')
+            # Never touched by SOD at all, before or after: nothing to say.
+            if s_then is None and s_now is None:
+                continue
+            stage = _journey_stage(s_then, listed_then, s_now, listed_now)
+            tally[stage] = tally.get(stage, 0) + 1
+            rows.append({
+                'store_number': sn,
+                'store_label': ', '.join(x for x in (account, address, city) if x),
+                'sku': sku,
+                'brand': SOD_TRACKED_SKUS.get(sku, ('', ''))[0],
+                'touched_on': claim,
+                'first_touch_type': ftype,
+                'stock_at_touch': s_then,
+                'listed_at_touch': listed_then,
+                'stock_now': s_now,
+                'listed_now': listed_now,
+                'stage': stage,
+                'bottles_landed': ((s_now or 0) - (s_then or 0))
+                if stage == 'converted' else 0,
+            })
+    rows.sort(key=lambda r: ({'converted': 0, 'listed_no_stock': 1,
+                              'still_dry': 2, 'already_stocked': 3}[r['stage']],
+                             r['store_number']))
+    return jsonify({
+        'as_of': str(latest_date) if latest_date else None,
+        'claimed_stores': len(accounts),
+        'rows': rows,
+        'summary': tally,
+        'billing_views': {
+            'agreed_rule': 'a new LISTED event dated on or after our first '
+                           'touch, one per store x SKU (see /api/anu-accounts)',
+            'stock_aware_candidates': tally.get('converted', 0),
+            'watchlist_listed_no_stock': tally.get('listed_no_stock', 0),
+        },
+        'note': 'converted = the shelf was empty when we touched it and holds '
+                'bottles now. This is a CANDIDATE under the stock-aware '
+                'reading, not an agreed billable: the agreed rule still keys '
+                'off the listing date. Agree the definition with the client '
+                'before invoicing on it.',
+    })
+
+
 _OFFICIAL_STORE_REPS = ('ikshit', 'vaneet', 'ed', 'namit')
 
 
