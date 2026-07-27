@@ -24036,6 +24036,92 @@ def _ensure_anu_accounts(db):
     _ANU_ACCOUNTS_READY = True
 
 
+_BILLING_OVR_READY = False
+
+
+def _ensure_billing_overrides(db):
+    """Owner-only manual billing overrides. Append-only: a revert is a new
+    row, never an edit, so every change keeps who/when/why forever."""
+    global _BILLING_OVR_READY
+    if _BILLING_OVR_READY:
+        return
+    pk = 'BIGSERIAL PRIMARY KEY' if USE_POSTGRES else 'INTEGER PRIMARY KEY AUTOINCREMENT'
+    cur = db.cursor()
+    try:
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS billing_overrides (
+            id {pk},
+            store_number INTEGER NOT NULL,
+            sku TEXT NOT NULL,
+            action TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_by TEXT DEFAULT 'owner',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        db.commit()
+    except Exception:
+        db.rollback()
+    cur.close()
+    _BILLING_OVR_READY = True
+
+
+def _billing_overrides_active(db):
+    """Latest action per store x SKU; only 'mark_billable' survives."""
+    _ensure_billing_overrides(db)
+    out = {}
+    try:
+        for sn, sku, action in db_fetchall(
+                "SELECT store_number, sku, action FROM billing_overrides "
+                "ORDER BY id"):
+            out[(int(sn), _pad_sku(sku))] = action
+    except Exception:
+        db.rollback()
+    return {k for k, v in out.items() if v == 'mark_billable'}
+
+
+@app.route('/api/billing/override', methods=['POST'])
+@require_admin_token
+def api_billing_override():
+    """Mark a store x SKU billable (or revert). Admin token only: this is
+    the founder's lock. Reason is mandatory because this line item lands on
+    a client invoice and must be defensible."""
+    d = request.get_json(silent=True) or {}
+    sn = d.get('store_number')
+    sku = _pad_sku((d.get('sku') or '').strip())
+    action = (d.get('action') or 'mark_billable').strip()
+    reason = (d.get('reason') or '').strip()
+    if not sn or not sku:
+        return jsonify({'error': 'store_number and sku required'}), 400
+    if action not in ('mark_billable', 'revert'):
+        return jsonify({'error': "action must be 'mark_billable' or 'revert'"}), 400
+    if len(reason) < 8:
+        return jsonify({'error': 'reason required (this lands on an '
+                                 'invoice; say why, e.g. "listed in store '
+                                 'system Jul 27, SOD lagging")'}), 400
+    db = get_db()
+    _ensure_billing_overrides(db)
+    cur = db.cursor()
+    ph = '%s' if USE_POSTGRES else '?'
+    cur.execute(f"INSERT INTO billing_overrides (store_number, sku, action, "
+                f"reason, created_by) VALUES ({ph},{ph},{ph},{ph},'owner')",
+                (int(sn), sku, action, reason))
+    db.commit()
+    cur.close()
+    return jsonify({'status': 'recorded', 'store_number': int(sn),
+                    'sku': sku, 'action': action})
+
+
+@app.route('/api/billing/overrides', methods=['GET'])
+@require_admin_token
+def api_billing_overrides_list():
+    db = get_db()
+    _ensure_billing_overrides(db)
+    rows = db_fetchall("SELECT id, store_number, sku, action, reason, "
+                       "CAST(created_at AS TEXT) FROM billing_overrides "
+                       "ORDER BY id DESC LIMIT 200")
+    return jsonify({'rows': [{'id': r[0], 'store_number': r[1], 'sku': r[2],
+                              'action': r[3], 'reason': r[4],
+                              'created_at': r[5]} for r in rows]})
+
+
 def _anu_listing_class(listing_date, claim_date):
     """Classify a LISTED ledger event against the claim, for billing:
     baseline (existed at launch), billable (new listing on/after our touch),
@@ -24273,22 +24359,32 @@ def api_anu_accounts():
                     "WHERE owner_status IS NOT NULL "
                     "AND owner_status != 'none'")}
 
+    _ovr_billable = _billing_overrides_active(db)
     rows = []
     total_billable = 0
     with_billable = with_order = 0
     for sn, ref, claimed_at, ftype, account, city in accounts:
+        _seen_skus = {e['sku'] for e in listings_by_store.get(sn, [])}
+        for (_osn, _osku) in _ovr_billable:
+            if _osn == sn and _osku not in _seen_skus:
+                listings_by_store.setdefault(sn, []).append(
+                    {'sku': _osku,
+                     'brand': SOD_TRACKED_SKUS.get(_osku, ('', ''))[0],
+                     'date': '', 'sources': {'manual'}})
         claim = str(claimed_at or '')
         t = touches.get(sn, {'by_type': {}, 'total': 0, 'last': ''})
         listings = []
         billable = 0
         for ev in listings_by_store.get(sn, []):
             cls = _anu_listing_class(ev['date'], claim)
+            if (sn, ev['sku']) in _ovr_billable:
+                cls = 'manual_override'   # founder's call, on the record
             listings.append({
                 'sku': ev['sku'], 'brand': ev['brand'], 'date': ev['date'],
                 'source': ','.join(sorted(ev['sources'])),
                 'classification': cls})
-            if cls == 'billable':      # one count per store×SKU, never per row
-                billable += 1
+            if cls in ('billable', 'manual_override'):
+                billable += 1          # one count per store x SKU, never per row
         total_billable += billable
         if billable:
             with_billable += 1

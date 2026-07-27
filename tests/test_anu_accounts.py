@@ -286,3 +286,68 @@ class TestBillingDefinition:
             db.commit()
         r = next(x for x in _accounts(client)['rows'] if x['store_number'] == 961)
         assert r['billable_listings'] == 1      # same store×SKU = one listing
+
+
+class TestFounderBillingOverride:
+    """Owner-only manual billable override, locked behind the admin token.
+    Append-only with mandatory reason: an invoice line must be defensible."""
+
+    def test_requires_admin_token(self, client):
+        # The decorator reads ADMIN_TOKEN from os.environ per request and is
+        # localhost-permissive when unset (dev convenience). Set it for THIS
+        # test only, restore in finally so no other suite is poisoned.
+        import os as _os
+        _os.environ['ADMIN_TOKEN'] = 'test-lock'
+        try:
+            r = client.post('/api/billing/override', json={
+                'store_number': 311, 'sku': '14318',
+                'reason': 'listed in store'})
+            assert r.status_code == 403
+            r2 = client.post('/api/billing/override',
+                             headers={'X-Admin-Token': 'wrong'},
+                             json={'store_number': 311, 'sku': '14318',
+                                   'reason': 'listed in store today ok'})
+            assert r2.status_code == 403
+        finally:
+            _os.environ.pop('ADMIN_TOKEN', None)
+
+    def test_override_flips_billable_and_labels_it(self, client, app_module):
+        hdr = {}   # localhost test client passes with no token configured
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            app_module._ensure_anu_accounts(db)
+            db.execute("INSERT OR IGNORE INTO stores (store_number, account) "
+                       "VALUES (311, 'LCBO #311')")
+            db.execute("INSERT OR IGNORE INTO anu_accounts (store_number, "
+                       "account_ref, claimed_at, first_touch_type) VALUES "
+                       "(311,'ANU-311','2026-07-24','store_visit')")
+            db.commit()
+        before = client.get('/api/anu-accounts').get_json()['summary']
+
+        r = client.post('/api/billing/override', headers=hdr, json={
+            'store_number': 311, 'sku': '14318',
+            'reason': 'listed in store system Jul 27, SOD lagging delivery'})
+        assert r.status_code == 200, r.get_json()
+
+        after = client.get('/api/anu-accounts').get_json()
+        assert after['summary']['billable_listings'] == \
+            before['billable_listings'] + 1
+        row = next(x for x in after['rows'] if x['store_number'] == 311)
+        assert any(l['classification'] == 'manual_override'
+                   for l in row['listings'])
+
+        # revert restores, and both actions stay on the ledger forever
+        r2 = client.post('/api/billing/override', headers=hdr, json={
+            'store_number': 311, 'sku': '14318', 'action': 'revert',
+            'reason': 'SOD landed, organic classification takes over'})
+        assert r2.status_code == 200
+        restored = client.get('/api/anu-accounts').get_json()['summary']
+        assert restored['billable_listings'] == before['billable_listings']
+        log = client.get('/api/billing/overrides', headers=hdr).get_json()
+        assert len([x for x in log['rows'] if x['store_number'] == 311]) == 2
+
+    def test_reason_is_mandatory(self, client):
+        r = client.post('/api/billing/override',
+                        json={'store_number': 311, 'sku': '14318',
+                              'reason': 'ok'})
+        assert r.status_code == 400
