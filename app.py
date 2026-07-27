@@ -1,6 +1,7 @@
 from __future__ import annotations  # 3.9-safe lazy annotations (str | None etc.)
 
 import os
+import time
 import io
 import csv
 import gc
@@ -5767,12 +5768,22 @@ def _sod_last_successful_sync_age_hours():
     return (datetime.utcnow() - val).total_seconds() / 3600.0
 
 
-def _max_snapshot_date():
+_SNAP_DATE_CACHE = {'val': None, 'at': 0.0}
+_SNAP_DATE_TTL = 1800  # 30 min: healthz pings must not wake the database
+
+
+def _max_snapshot_date(force=False):
     """Get MAX(snapshot_date) from sod_inventory using a dedicated connection.
 
-    Safe to call outside Flask request context (e.g. from startup/scheduler).
-    Returns a date or None.
+    Cached for 30 minutes: uptime monitors ping /healthz constantly and each
+    uncached call woke the Neon compute. That standing wake burned the free
+    compute quota and took the tracker dark on 2026-07-26. force=True
+    bypasses (used right after an ingest write).
     """
+    now_ts = time.time()
+    if not force and _SNAP_DATE_CACHE['val'] is not None and \
+            (now_ts - _SNAP_DATE_CACHE['at']) < _SNAP_DATE_TTL:
+        return _SNAP_DATE_CACHE['val']
     try:
         conn = _sod_get_conn()
         cur = conn.cursor()
@@ -5780,30 +5791,33 @@ def _max_snapshot_date():
         r = cur.fetchone()
         cur.close()
         conn.close()
-        if not r:
-            return None
-        snap = r[0]
-        if snap is None:
-            return None
-        if isinstance(snap, str):
-            try:
-                return datetime.strptime(snap, '%Y-%m-%d').date()
-            except Exception:
-                return None
-        if hasattr(snap, 'date'):
-            return snap.date()
-        return snap
+        snap = r[0] if r else None
+        val = None
+        if snap is not None:
+            if isinstance(snap, str):
+                try:
+                    val = datetime.strptime(snap, '%Y-%m-%d').date()
+                except Exception:
+                    val = None
+            elif hasattr(snap, 'date'):
+                val = snap.date()
+            else:
+                val = snap
+        _SNAP_DATE_CACHE['val'] = val
+        _SNAP_DATE_CACHE['at'] = time.time()
+        return val
     except Exception:
-        return None
+        _SNAP_DATE_CACHE['at'] = time.time()
+        return _SNAP_DATE_CACHE['val']
 
 
-def _sod_data_age_days():
+def _sod_data_age_days(force=False):
     """Return days between today (Toronto) and the freshest snapshot in sod_inventory.
 
     This is the TRUE freshness — what the user actually cares about.
     Returns None if no data ingested yet.
     """
-    snap = _max_snapshot_date()
+    snap = _max_snapshot_date(force=force)
     if snap is None:
         return None
     try:
@@ -5842,7 +5856,7 @@ def _last_successful_run_age_hours_safe():
         return None
 
 
-def _sod_freshness():
+def _sod_freshness(force=False):
     """Return a freshness summary dict used by every report response.
 
     Keys:
@@ -5851,7 +5865,7 @@ def _sod_freshness():
       is_stale: bool (True if age > 1 day — emails an alert at the next health check)
       last_run_age_hours: float or None
     """
-    snap = _max_snapshot_date()
+    snap = _max_snapshot_date(force=force)
     age_days = None
     if snap is not None:
         try:
@@ -6057,7 +6071,7 @@ def api_sod_health():
       503 + status='stale' if snapshot is > 1 day old.
       503 + status='never_synced' if no data ingested yet.
     """
-    fresh_info = _sod_freshness()
+    fresh_info = _sod_freshness(force=True)
     age_days = fresh_info['snapshot_age_days']
     age_hours = _sod_last_successful_sync_age_hours()
     if age_days is None:
@@ -6091,7 +6105,7 @@ def api_healthz():
     cron) but NOT from public uptime services like UptimeRobot.
     """
     deep = request.args.get('deep') in ('1', 'true', 'yes')
-    fresh = _sod_freshness()
+    fresh = _sod_freshness(force=deep)
     age_days = fresh.get('snapshot_age_days')
     # Strict (deep) freshness threshold relaxed to 2 days — accounts for
     # weekends where LCBO may not publish a fresh file Sat/Sun. The hourly

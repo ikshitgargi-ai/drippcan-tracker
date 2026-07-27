@@ -302,10 +302,13 @@ class TestFreshnessFromSnapshotDate:
         conn.commit()
         conn.close()
 
-        age = m._sod_data_age_days()
+        # force=True: this test asserts the freshness MATH. The 30-min cache
+        # exists so healthz pings cannot wake the database (2026-07-26 Neon
+        # quota outage); strict monitors bypass it.
+        age = m._sod_data_age_days(force=True)
         assert age == 5, f"BUG: data age should be 5 days, got {age}"
 
-        fresh = m._sod_freshness()
+        fresh = m._sod_freshness(force=True)
         assert fresh['snapshot_age_days'] == 5
         assert fresh['is_stale'] is True, "BUG: is_stale should be True when age > 2 days"
 

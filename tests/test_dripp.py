@@ -487,8 +487,17 @@ class TestChangesAndAttribution:
         return {'converted': s_converted, 'organic': s_organic,
                 'baseline': s_baseline, 'dropped': s_dropped}
 
-    def test_changes_tagged_with_tier_route_and_attribution(self, change_stores, client):
-        body = client.get(f'/api/changes?days=14&sku={PHOENIX}&nocache=1').get_json()
+    def test_changes_tagged_with_tier_route_and_attribution(self, change_stores,
+                                                             client, app_module):
+        # The seeds are FIXED dates around LAUNCH_DATE (2026-07-15) because
+        # attribution semantics pivot on that boundary. A fixed ?days=14
+        # window aged the 2026-07-10 baseline row out on 2026-07-25 and the
+        # test started failing on date drift alone. Compute the window so it
+        # always reaches back past the earliest seeded change.
+        days_needed = (app_module._toronto_today()
+                       - __import__('datetime').date(2026, 7, 8)).days
+        body = client.get(
+            f'/api/changes?days={days_needed}&sku={PHOENIX}&nocache=1').get_json()
         rows = {(r['store_number'], r['change_type']): r
                 for r in body['rows'] if r['source'] == 'sod'}
 
