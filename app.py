@@ -9846,6 +9846,20 @@ def api_listings_added():
         f"{sku_clause}"
         "ORDER BY observed_date DESC, id DESC", params)
 
+    # RELIST GUARD. A store that blips out of one SOD file and returns the
+    # next day produces DELISTED + LISTED ledger events (the ledger honestly
+    # records what the feed said). But that second LISTED is a re-listing,
+    # not a new listing, and must never earn rep credit: store #390 dropped
+    # from the 2026-07-23 file, returned 07-24 after a rep tasting on 07-20,
+    # and the feed showed it as rep_converted in the owner's view. A listing
+    # with ANY earlier LISTED event for the same store x SKU is 'relisted'.
+    first_listed = {}
+    for fsn, fsku, fdate in db_fetchall(
+            "SELECT store_number, sku, MIN(CAST(observed_date AS TEXT)) "
+            "FROM listing_ledger WHERE event='LISTED' "
+            "GROUP BY store_number, sku"):
+        first_listed[(int(fsn), fsku)] = str(fdate)
+
     out = []
     by_source = {}
     by_attribution = {}
@@ -9853,7 +9867,10 @@ def api_listings_added():
         d = row_to_dict(r)
         sn = int(d['store_number'])
         tinfo = territory.get(sn) or {}
-        attribution = _attribution_for(sn, d['observed_date'], touch_first)
+        if first_listed.get((sn, d['sku']), d['observed_date']) < d['observed_date']:
+            attribution = 'relisted'
+        else:
+            attribution = _attribution_for(sn, d['observed_date'], touch_first)
         out.append({
             'sku': d['sku'],
             'brand': _ledger_brand(d['sku']),

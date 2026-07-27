@@ -153,3 +153,32 @@ class TestBillingRestraint:
         actual = Counter(r['stage'] for r in body['rows'])
         for stage, n in body['summary'].items():
             assert actual.get(stage, 0) == n, f'{stage} count disagrees'
+
+
+class TestRelistGuard:
+    """A one-day feed blip (DELISTED then LISTED next day) must show as
+    'relisted' in the added feed, never as rep_converted or organic. This is
+    the real #390 case: listed since Jul 13, blipped out of the Jul 23 file,
+    returned Jul 24 after a Jul 20 tasting, and the owner's view credited it
+    to the rep."""
+
+    def test_blip_relist_never_earns_rep_credit(self, seeded, client,
+                                                app_module):
+        with app_module.app.app_context():
+            db = app_module.get_db()   # listing_ledger is in the base schema
+            for ev, dt in (('LISTED', '2026-07-13'),
+                           ('DELISTED', '2026-07-23'),
+                           ('LISTED', '2026-07-24')):
+                db.execute(
+                    "INSERT INTO listing_ledger (sku, store_number, event, "
+                    "observed_date, source, source_detail) "
+                    "VALUES (?, 390, ?, ?, 'sod', 'blip-test')",
+                    (PHOENIX, ev, dt))
+            db.commit()
+        body = client.get(
+            f'/api/listings/added?since=2026-07-16&sku={PHOENIX}&nocache=1'
+        ).get_json()
+        r390 = [r for r in body['rows'] if r['store_number'] == 390]
+        assert r390, 'the relist event should appear in the window'
+        assert all(x['attribution'] == 'relisted' for x in r390), r390
+        assert body['summary']['by_attribution'].get('rep_converted', 0) == 0
