@@ -123,7 +123,7 @@ class TestBillingClassification:
         with app_module.app.app_context():
             db = app_module.get_db()
             cur = db.cursor()
-            # Baseline: PHOENIX listed before/at launch (2026-07-15).
+            # Baseline: PHOENIX listed before/at launch (2026-07-16).
             app_module._ledger_record(cur, PHOENIX, 901, 'LISTED', 'sod',
                                       'test', '2026-07-13')
             # Billable: a DIFFERENT SKU (Dayaa) newly listed after our claim.
@@ -136,7 +136,7 @@ class TestBillingClassification:
                 "INSERT OR IGNORE INTO stores (store_number, account, city) "
                 "VALUES (?,?,?)", (903, 'Test Late Touch', 'Vaughan'))
             app_module._ledger_record(cur, PHOENIX, 903, 'LISTED', 'live',
-                                      'test', '2026-07-16')
+                                      'test', '2026-07-17')
             db.commit()
         _log(client, 903, 'store_visit', visit_date='2026-07-20')
 

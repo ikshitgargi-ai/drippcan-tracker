@@ -456,9 +456,9 @@ class TestChangesAndAttribution:
             "SELECT store_number FROM territory_stores WHERE tier='routed' "
             "ORDER BY store_number LIMIT 4").fetchall()]
         s_converted, s_organic, s_baseline, s_dropped = stores
-        # New listings: two after LAUNCH_DATE (2026-07-15), one before
-        for sn, d, ctype in ((s_converted, '2026-07-16', 'NEW_LISTING'),
-                             (s_organic, '2026-07-16', 'NEW_LISTING'),
+        # New listings: two after LAUNCH_DATE (2026-07-16), one before
+        for sn, d, ctype in ((s_converted, '2026-07-17', 'NEW_LISTING'),
+                             (s_organic, '2026-07-17', 'NEW_LISTING'),
                              (s_baseline, '2026-07-10', 'NEW_LISTING'),
                              (s_dropped, '2026-07-12', 'DROPPED')):
             db.execute(
@@ -468,7 +468,7 @@ class TestChangesAndAttribution:
         # Touchpoints: visit BEFORE the listing at s_converted and s_baseline
         rep_id = db.execute(
             "SELECT id FROM reps WHERE name='Ikshit'").fetchone()[0]
-        for sn, ts in ((s_converted, '2026-07-15 09:00:00'),
+        for sn, ts in ((s_converted, '2026-07-16 09:00:00'),
                        (s_baseline, '2026-07-01 09:00:00')):
             store_row = db.execute(
                 "SELECT id FROM stores WHERE store_number=?", (sn,)).fetchone()
@@ -489,7 +489,7 @@ class TestChangesAndAttribution:
 
     def test_changes_tagged_with_tier_route_and_attribution(self, change_stores,
                                                              client, app_module):
-        # The seeds are FIXED dates around LAUNCH_DATE (2026-07-15) because
+        # The seeds are FIXED dates around LAUNCH_DATE (2026-07-16) because
         # attribution semantics pivot on that boundary. A fixed ?days=14
         # window aged the 2026-07-10 baseline row out on 2026-07-25 and the
         # test started failing on date drift alone. Compute the window so it
@@ -601,7 +601,7 @@ class TestConversion:
 
     def test_conversion_scoreboard(self, conv_stores, client):
         body = client.get(f'/api/conversion?days=60&sku={DAYAA}&nocache=1').get_json()
-        assert body['launch_date'] == '2026-07-15'
+        assert body['launch_date'] == '2026-07-16'
         assert body['touchpoints'] >= 1
         assert body['stores_touched'] >= 1
         rows = {r['store_number']: r for r in body['per_store']}

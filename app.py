@@ -22053,10 +22053,11 @@ def api_crm_lcbo_rescan():
 
 from html import unescape as _html_unescape
 
-# Attribution baseline: reps start field work 2026-07-15. Listings on or
-# before this date are 'baseline'; after it they are 'rep_converted' when a
-# touchpoint precedes the listing, else 'organic'.
-LAUNCH_DATE = '2026-07-15'
+# Attribution baseline, aligned with the signed sales agency agreement
+# (contract Launch Date 16 July 2026, founder instruction 2026-08-04).
+# Listings on or before this date are 'baseline'; after it they are
+# 'rep_converted' when a touchpoint precedes the listing, else 'organic'.
+LAUNCH_DATE = '2026-07-16'
 
 # Path to the seed book. Ingest is idempotent + re-runnable; never deletes.
 TERRITORY_SEED_PATH = os.path.join(BASE_DIR, 'data', 'territory_seed.json')
