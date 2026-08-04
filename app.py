@@ -2222,19 +2222,34 @@ def api_stores():
     query = "SELECT * FROM stores WHERE 1=1"
     params = []
     if search:
-        query += " AND (CAST(store_number AS TEXT) LIKE ? OR account LIKE ? OR address LIKE ? OR city LIKE ? OR manager_name LIKE ?)"
+        # LOWER() both sides: Postgres LIKE is case-sensitive, so lowercase
+        # searches silently returned nothing in production.
+        query += (" AND (CAST(store_number AS TEXT) LIKE ?"
+                  " OR LOWER(account) LIKE ? OR LOWER(address) LIKE ?"
+                  " OR LOWER(city) LIKE ? OR LOWER(manager_name) LIKE ?)")
         s = f"%{search}%"
-        params.extend([s, s, s, s, s])
+        sl = f"%{search.lower()}%"
+        params.extend([s, sl, sl, sl, sl])
     if city:
-        query += " AND city LIKE ?"
-        params.append(f"%{city}%")
+        query += " AND LOWER(city) LIKE ?"
+        params.append(f"%{city.lower()}%")
     if producer:
-        query += " AND producer LIKE ?"
-        params.append(f"%{producer}%")
+        query += " AND LOWER(producer) LIKE ?"
+        params.append(f"%{producer.lower()}%")
 
     count_query = query.replace("SELECT *", "SELECT COUNT(*)", 1)
     total = db_fetchone(count_query, params)
-    total = total[0] if isinstance(total, tuple) else (total.get('count', 0) if isinstance(total, dict) else list(total.values())[0])
+    # sqlite3.Row has no .values(); index-first works for tuple, Row and
+    # psycopg2 rows alike. The old fallback 500'd this endpoint on SQLite.
+    if total is None:
+        total = 0
+    elif isinstance(total, dict):
+        total = total.get('count', 0)
+    else:
+        try:
+            total = total[0]
+        except (TypeError, KeyError, IndexError):
+            total = 0
 
     query += " ORDER BY store_number ASC LIMIT ? OFFSET ?"
     params.extend([per_page, (page - 1) * per_page])
