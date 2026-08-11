@@ -15262,7 +15262,18 @@ def _backfill_store_sku_changes():
                 for store, new_st in curr_per_store.items():
                     old_st = prev_per_store.get(store)
                     if old_st is None:
-                        inserts.append((sku, store, curr_date, None, new_st, 'NEW_LISTING'))
+                        # First time this store has ever shown up carrying this
+                        # SKU. Only status 'L' is a real listing. A first
+                        # sighting that is already delisted ('D' or 'F') is not
+                        # a placement, so it must never be filed as NEW_LISTING:
+                        # that event folds into the immutable listing ledger as
+                        # LISTED and gets billed to the client. old_status is
+                        # left NULL so a first sighting stays tellable apart
+                        # from a store we actually lost.
+                        if new_st == 'L':
+                            inserts.append((sku, store, curr_date, None, new_st, 'NEW_LISTING'))
+                        else:
+                            inserts.append((sku, store, curr_date, None, new_st, 'DELISTED'))
                     elif old_st != new_st:
                         if new_st == 'L' and old_st in ('D', 'F'):
                             inserts.append((sku, store, curr_date, old_st, new_st, 'RELISTED'))
