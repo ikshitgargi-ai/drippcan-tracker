@@ -309,7 +309,7 @@ class TestRosterHygiene:
     def test_stale_row_stays_in_db_but_out_of_api_reps(self, ingested, seeded, client):
         body = client.get('/api/reps').get_json()
         names = {r['name'] for r in body}
-        assert names == {'Ikshit', 'Vaneet', 'Ed', 'Namit'}
+        assert names == {'Ikshit', 'Namit', 'Surya', 'Vaneet', 'Ed'}
         assert 'Ikshit Sharma' not in names
         # NOTHING deleted: the legacy row is still in the table
         db = _db()
@@ -327,14 +327,14 @@ class TestRosterHygiene:
     def test_rep_performance_is_roster_only(self, ingested, seeded, client):
         body = client.get('/api/crm/rep-performance?days=30&nocache=1').get_json()
         reps = [e['rep'] for e in body['reps']]
-        assert sorted(reps) == sorted(['Ikshit', 'Vaneet', 'Ed', 'Namit'])
+        assert sorted(reps) == sorted(['Ikshit', 'Namit', 'Surya', 'Vaneet', 'Ed'])
         assert 'Ikshit Sharma' not in reps
 
     def test_dashboard_by_rep_excludes_stale(self, ingested, seeded, client):
         body = client.get('/api/dashboard').get_json()
         names = set(body['by_rep'].keys())
         assert 'Ikshit Sharma' not in names
-        assert names == {'Ikshit', 'Vaneet', 'Ed', 'Namit'}
+        assert names == {'Ikshit', 'Namit', 'Surya', 'Vaneet', 'Ed'}
 
 
 class TestBackupCompleteness:
