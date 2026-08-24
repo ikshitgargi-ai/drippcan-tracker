@@ -22958,7 +22958,7 @@ def _last_touchpoints():
 def _first_touchpoints():
     """{store_number: 'YYYY-MM-DD'} — EARLIEST activity date per store (attribution)."""
     rows = db_fetchall(
-        "SELECT st.store_number AS store_number, MIN(a.created_at) AS first_touch "
+        "SELECT st.store_number AS store_number, MIN(COALESCE(NULLIF(a.visit_date,''), CAST(a.created_at AS TEXT))) AS first_touch "
         "FROM activities a JOIN stores st ON a.store_id = st.id "
         "WHERE a.deleted_at IS NULL GROUP BY st.store_number"
     )
@@ -24844,7 +24844,17 @@ def _dripp_billing_reconcile(db):
     for (sn, sku), d in earliest.items():
         brand = SOD_TRACKED_SKUS.get(sku, ('', ''))[0]
         if (sn, sku) in overrides:
-            buckets['billed_override'] += 1
+            if sn in claimed_at:
+                buckets['billed_override'] += 1
+            else:
+                # The founder marked this billable, but the store is not in
+                # anu_accounts, and the invoice only bills anu_accounts stores,
+                # so the override is silently ignored. That is a leak.
+                buckets['leak_billable_unclaimed'] += 1
+                leaks.append({'store_number': sn, 'sku': sku, 'listed': d,
+                              'brand': brand,
+                              'reason': 'founder override on a store not in '
+                                        'anu_accounts; the invoice will not bill it'})
             continue
         attr = _attribution_for(sn, d, touch_first)   # baseline|rep_converted|organic
         if attr == 'baseline':
@@ -24882,24 +24892,53 @@ def _dripp_billing_reconcile(db):
     # for a tracked SKU, that produced NO LISTED ledger event. The invoice and
     # the buckets both read the ledger, so a listing missing from it is unpaid
     # AND uncounted. This is the deepest leak.
+    # Ledger completeness against the DURABLE change log, not just the newest
+    # snapshot. A listing can NEW_LISTING after launch, have its ledger fold
+    # fail, then delist, so it is gone from the latest snapshot yet still owed.
+    # Every post-launch NEW_LISTING/RELISTED change and every LIVE_NEW_LISTING
+    # event must have a LISTED ledger row; any that does not is a gap.
     ledger_gaps = []
+    ph = '%s' if USE_POSTGRES else '?'
+    expected = set()
+    try:
+        for r in db_fetchall(
+                "SELECT store_number, sku FROM sod_store_sku_changes "
+                "WHERE change_type IN ('NEW_LISTING','RELISTED') "
+                "AND CAST(change_date AS TEXT) > " + ph, (launch,)):
+            rd = row_to_dict(r)
+            if rd.get('store_number') is not None:
+                expected.add((int(rd['store_number']), str(rd['sku'])))
+    except Exception:
+        pass
+    try:
+        for r in db_fetchall(
+                "SELECT store_number, sku FROM live_listing_events "
+                "WHERE event_type IN ('LIVE_NEW_LISTING','LIVE_RELISTED') "
+                "AND CAST(event_date AS TEXT) > " + ph, (launch,)):
+            rd = row_to_dict(r)
+            if rd.get('store_number') is not None:
+                expected.add((int(rd['store_number']), str(rd['sku'])))
+    except Exception:
+        pass
+    # belt-and-suspenders: anything Listed in the freshest snapshot too
     latest = (row_to_dict(db_fetchone(
         "SELECT MAX(snapshot_date) AS d FROM sod_inventory") or {}) or {}).get('d')
     if latest and str(latest)[:10] > launch:
-        phs = ','.join(['%s' if USE_POSTGRES else '?'] * len(SOD_TRACKED_SKUS))
-        ph = '%s' if USE_POSTGRES else '?'
+        phs = ','.join([ph] * len(SOD_TRACKED_SKUS))
         for r in db_fetchall(
                 f"SELECT store_number, sku FROM sod_inventory "
                 f"WHERE snapshot_date={ph} AND status='L' AND sku IN ({phs})",
                 [latest] + list(SOD_TRACKED_SKUS.keys())):
             rd = row_to_dict(r)
-            key = (int(rd['store_number']), str(rd['sku']))
-            if key not in earliest:
-                buckets['ledger_gap'] += 1
-                ledger_gaps.append({'store_number': key[0], 'sku': key[1],
-                                    'brand': SOD_TRACKED_SKUS.get(key[1], ('', ''))[0],
-                                    'reason': 'Listed in SOD after launch but no '
-                                              'LISTED ledger event; run /api/listings/rebuild'})
+            expected.add((int(rd['store_number']), str(rd['sku'])))
+    for key in expected:
+        if key not in earliest and key[1] in SOD_TRACKED_SKUS:
+            buckets['ledger_gap'] += 1
+            ledger_gaps.append({'store_number': key[0], 'sku': key[1],
+                                'brand': SOD_TRACKED_SKUS.get(key[1], ('', ''))[0],
+                                'reason': 'a post-launch listing signal (change log '
+                                          'or live SOD) has no LISTED ledger event; '
+                                          'run /api/listings/rebuild'})
 
     # Pre-launch stores that delisted then genuinely re-listed after launch:
     # the earliest-LISTED convention baselines them, but a rep-driven relist may
@@ -24916,10 +24955,23 @@ def _dripp_billing_reconcile(db):
             had_delist = any(e == 'DELISTED' for e, _ in seq)
             relist_after = any(e == 'LISTED' and dt > launch for e, dt in seq)
             if had_delist and relist_after:
-                relisted.append({'store_number': sn, 'sku': sku,
-                                 'first_listed': d,
-                                 'reason': 'listed pre-launch, delisted, re-listed '
-                                           'after launch; confirm if billable'})
+                relist_dates = [dt for e, dt in seq if e == 'LISTED' and dt > launch]
+                relist_on = min(relist_dates) if relist_dates else ''
+                tf = touch_first.get(int(sn))
+                rep_drove = bool(tf) and bool(relist_on) and str(tf)[:10] <= relist_on
+                item = {'store_number': sn, 'sku': sku, 'first_listed': d,
+                        'relisted_on': relist_on,
+                        'reason': 'listed pre-launch, delisted, re-listed after '
+                                  'launch' + (' on rep work' if rep_drove else '')}
+                relisted.append(item)
+                if rep_drove and (sn, sku) not in overrides:
+                    # A rep drove a genuine post-launch re-listing. The earliest
+                    # -date convention baselines it, so it is unpaid. Surface as
+                    # a leak so the gate does not read clean over real money.
+                    buckets['leak_relist_unbilled'] = buckets.get('leak_relist_unbilled', 0) + 1
+                    leaks.append({**item, 'reason': 'rep drove a post-launch '
+                                  're-listing but the earliest-date rule baselines '
+                                  'it, so the invoice never bills it'})
 
     total = len(earliest)
     reconciled = len(leaks) == 0 and len(ledger_gaps) == 0

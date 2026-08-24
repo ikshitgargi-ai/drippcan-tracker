@@ -175,3 +175,81 @@ class TestAuditGapsClosed:
         assert 5203 in {g['store_number'] for g in r['ledger_gaps']}, \
             'a listing in SOD with no ledger event must be surfaced'
         assert r['reconciled'] is False
+
+
+class TestSecondPassGapsClosed:
+    def _fresh(self, app_module):
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            for t in ('listing_ledger', 'anu_accounts', 'activities',
+                      'sod_store_sku_changes', 'billing_overrides'):
+                try:
+                    db.execute(f"DELETE FROM {t}")
+                except Exception:
+                    pass
+            db.commit()
+
+    def test_override_on_unclaimed_store_is_a_leak(self, app_module, client):
+        self._fresh(app_module)
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
+                       "VALUES (5301,'LCBO #5301','Toronto')")
+            db.execute("INSERT INTO listing_ledger (sku, store_number, event, "
+                       "observed_date, source, source_detail) VALUES "
+                       "(?,5301,'LISTED','2026-07-25','sod','t')", (PHX,))
+            # founder marks it billable, but the store was never claimed
+            app_module._ensure_billing_overrides(db) if hasattr(app_module, '_ensure_billing_overrides') else None
+            try:
+                db.execute("INSERT INTO billing_overrides (store_number, sku, action, "
+                           "reason) VALUES (5301, ?, 'mark_billable', 'known win')", (PHX,))
+            except Exception:
+                db.execute("INSERT INTO billing_overrides (store_number, sku, action, "
+                           "reason, created_at) VALUES (5301, ?, 'mark_billable', 'x', "
+                           "'2026-07-25')", (PHX,))
+            db.commit()
+        r = client.get('/api/billing/reconcile').get_json()
+        assert 5301 in {l['store_number'] for l in r['leaks']}, \
+            'an override the invoice cannot bill must be a leak'
+        assert r['reconciled'] is False
+
+    def test_rep_driven_post_launch_relist_is_a_leak(self, app_module, client):
+        self._fresh(app_module)
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
+                       "VALUES (5302,'LCBO #5302','Toronto')")
+            db.execute("INSERT OR IGNORE INTO reps (name) VALUES ('Namit')")
+            rid = db.execute("SELECT id FROM reps WHERE name='Namit'").fetchone()[0]
+            sid = db.execute("SELECT id FROM stores WHERE store_number=5302").fetchone()[0]
+            # listed pre-launch, delisted, then rep-driven relist after launch
+            for ev, d in (('LISTED','2026-07-01'), ('DELISTED','2026-07-10'),
+                          ('LISTED','2026-07-25')):
+                db.execute("INSERT INTO listing_ledger (sku, store_number, event, "
+                           "observed_date, source, source_detail) VALUES "
+                           "(?,5302,?,?,'sod','t')", (PHX, ev, d))
+            db.execute("INSERT INTO activities (store_id, rep_id, activity_type, rep, "
+                       "created_at, visit_date) VALUES (?,?,?,?, ?, '2026-07-20')",
+                       (sid, rid, 'store_visit', 'Namit', '2026-07-20 09:00:00'))
+            db.commit()
+        r = client.get('/api/billing/reconcile').get_json()
+        assert 5302 in {l['store_number'] for l in r['leaks']}, \
+            'a rep-driven post-launch relist must not be silently baselined'
+        assert r['reconciled'] is False
+
+    def test_churned_listing_in_change_log_is_a_gap(self, app_module, client):
+        self._fresh(app_module)
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
+                       "VALUES (5303,'LCBO #5303','Toronto')")
+            # a post-launch NEW_LISTING in the durable change log, but no LISTED
+            # ledger event (fold failed) and not in the newest snapshot (churned)
+            db.execute("INSERT INTO sod_store_sku_changes (sku, store_number, "
+                       "change_date, old_status, new_status, change_type) VALUES "
+                       "(?,5303,'2026-07-25',NULL,'L','NEW_LISTING')", (PHX,))
+            db.commit()
+        r = client.get('/api/billing/reconcile').get_json()
+        assert 5303 in {g['store_number'] for g in r['ledger_gaps']}, \
+            'a churned post-launch listing must be caught via the change log'
+        assert r['reconciled'] is False
