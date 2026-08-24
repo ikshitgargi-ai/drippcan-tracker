@@ -22958,7 +22958,7 @@ def _last_touchpoints():
 def _first_touchpoints():
     """{store_number: 'YYYY-MM-DD'} — EARLIEST activity date per store (attribution)."""
     rows = db_fetchall(
-        "SELECT st.store_number AS store_number, MIN(COALESCE(NULLIF(a.visit_date,''), CAST(a.created_at AS TEXT))) AS first_touch "
+        "SELECT st.store_number AS store_number, MIN(COALESCE(NULLIF(CAST(a.visit_date AS TEXT),''), CAST(a.created_at AS TEXT))) AS first_touch "
         "FROM activities a JOIN stores st ON a.store_id = st.id "
         "WHERE a.deleted_at IS NULL GROUP BY st.store_number"
     )
