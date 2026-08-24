@@ -2449,15 +2449,15 @@ def api_activity_create():
 
     if USE_POSTGRES:
         row = db_fetchone(
-            "INSERT INTO activities (store_id, rep_id, activity_type, producer, venue_type, notes, follow_up_date) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-            (store_id, rep_id, activity_type, producer, venue_type, notes, follow_up_date)
+            "INSERT INTO activities (store_id, rep_id, activity_type, producer, venue_type, notes, follow_up_date, visit_date) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (store_id, rep_id, activity_type, producer, venue_type, notes, follow_up_date, _toronto_today().isoformat())
         )
         db_commit()
         new_id = row['id']
     else:
         db_execute(
-            "INSERT INTO activities (store_id, rep_id, activity_type, producer, venue_type, notes, follow_up_date) VALUES (?,?,?,?,?,?,?)",
-            (store_id, rep_id, activity_type, producer, venue_type, notes, follow_up_date)
+            "INSERT INTO activities (store_id, rep_id, activity_type, producer, venue_type, notes, follow_up_date, visit_date) VALUES (?,?,?,?,?,?,?,?)",
+            (store_id, rep_id, activity_type, producer, venue_type, notes, follow_up_date, _toronto_today().isoformat())
         )
         db_commit()
         last = db_fetchone("SELECT last_insert_rowid() as id")
@@ -22957,8 +22957,16 @@ def _last_touchpoints():
 
 def _first_touchpoints():
     """{store_number: 'YYYY-MM-DD'} — EARLIEST activity date per store (attribution)."""
+    # created_at is stored as naive UTC; reps work in America/Toronto. An
+    # evening-ET touch would otherwise roll to the next UTC day and mis-date the
+    # attribution one day late, so we convert before truncating, exactly as the
+    # day-book query does. visit_date is already Toronto-local, so it is used
+    # as-is when present.
+    _cvt = ("((a.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'America/Toronto')::text"
+            if USE_POSTGRES else "datetime(a.created_at, '-5 hours')")
     rows = db_fetchall(
-        "SELECT st.store_number AS store_number, MIN(COALESCE(NULLIF(CAST(a.visit_date AS TEXT),''), CAST(a.created_at AS TEXT))) AS first_touch "
+        "SELECT st.store_number AS store_number, MIN(COALESCE("
+        "NULLIF(CAST(a.visit_date AS TEXT), ''), " + _cvt + ")) AS first_touch "
         "FROM activities a JOIN stores st ON a.store_id = st.id "
         "WHERE a.deleted_at IS NULL GROUP BY st.store_number"
     )
@@ -24826,6 +24834,17 @@ def _dripp_billing_reconcile(db):
         if sn is None or not sku:
             continue
         earliest[(int(sn), str(sku))] = str(odate)[:10] if odate else ''
+    # Source of each store x SKU's LISTED events. A source='rep' event means a
+    # rep physically saw our product on the shelf ("Saw on shelf"), which is
+    # direct evidence Anu drove it, even when there is no activities visit and
+    # the store was never claimed. That path writes the ledger but not
+    # anu_accounts, so the invoice would never bill it.
+    rep_sourced = set()
+    for r in db_fetchall(
+            "SELECT store_number, sku FROM listing_ledger "
+            "WHERE event='LISTED' AND source='rep' GROUP BY store_number, sku"):
+        if r[0] is not None:
+            rep_sourced.add((int(r[0]), str(r[1])))
 
     # Per-store claim date (what the INVOICE actually anchors billing on), not
     # just membership, so we can run the invoice's own classifier here.
@@ -24882,7 +24901,15 @@ def _dripp_billing_reconcile(db):
             leaks.append({'store_number': sn, 'sku': sku, 'listed': d,
                           'brand': brand,
                           'reason': 'rep touched before listing but store not claimed'})
-        else:  # organic, unclaimed
+        elif (sn, sku) in rep_sourced:
+            # A rep saw it on the shelf (source='rep') but the store was never
+            # claimed, so the invoice never bills it. That is a leak, not review.
+            buckets['leak_billable_unclaimed'] += 1
+            leaks.append({'store_number': sn, 'sku': sku, 'listed': d,
+                          'brand': brand,
+                          'reason': "rep logged 'saw on shelf' but the store is "
+                                    "not in anu_accounts, so the invoice drops it"})
+        else:  # organic, unclaimed, no rep evidence at all
             buckets['review_organic'] += 1
             review.append({'store_number': sn, 'sku': sku, 'listed': d,
                            'brand': brand,

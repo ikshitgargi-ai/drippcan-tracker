@@ -253,3 +253,52 @@ class TestSecondPassGapsClosed:
         assert 5303 in {g['store_number'] for g in r['ledger_gaps']}, \
             'a churned post-launch listing must be caught via the change log'
         assert r['reconciled'] is False
+
+
+class TestThirdPassGapsClosed:
+    """The rule (CEO): a store a rep touched that then gets a listing is
+    billable. These close the last two ways a touched+listed store slipped."""
+
+    def _fresh(self, app_module):
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            for t in ('listing_ledger', 'anu_accounts', 'activities'):
+                db.execute(f"DELETE FROM {t}")
+            db.commit()
+
+    def test_rep_saw_on_shelf_at_unclaimed_store_is_a_leak(self, app_module, client):
+        self._fresh(app_module)
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
+                       "VALUES (5401,'LCBO #5401','Toronto')")
+            # a rep tapped "saw on shelf": ledger LISTED source='rep', no activity,
+            # store never claimed. The invoice would never bill it.
+            db.execute("INSERT INTO listing_ledger (sku, store_number, event, "
+                       "observed_date, source, source_detail) VALUES "
+                       "(?,5401,'LISTED','2026-07-25','rep','saw it')", (PHX,))
+            db.commit()
+        r = client.get('/api/billing/reconcile').get_json()
+        assert 5401 in {l['store_number'] for l in r['leaks']}, \
+            "a rep's saw-on-shelf listing must be billable, not written off"
+        assert r['reconciled'] is False
+
+    def test_evening_touch_is_dated_in_toronto_not_utc(self, app_module):
+        # A 9pm ET touch stored as next-day UTC must still attribute to the ET
+        # day, so a same-ET-day listing counts as rep-driven.
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute("DELETE FROM activities")
+            db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
+                       "VALUES (5402,'LCBO #5402','Toronto')")
+            db.execute("INSERT OR IGNORE INTO reps (name) VALUES ('Namit')")
+            rid = db.execute("SELECT id FROM reps WHERE name='Namit'").fetchone()[0]
+            sid = db.execute("SELECT id FROM stores WHERE store_number=5402").fetchone()[0]
+            # created_at in UTC that is the next calendar day vs Toronto; no visit_date
+            db.execute("INSERT INTO activities (store_id, rep_id, activity_type, "
+                       "created_at) VALUES (?,?,?, '2026-07-20 01:00:00')",
+                       (sid, rid, 'store_visit'))
+            db.commit()
+            tf = app_module._first_touchpoints()
+        # -5h converts 2026-07-20 01:00 UTC to 2026-07-19 20:00 ET
+        assert tf.get(5402) == '2026-07-19', f"expected Toronto date, got {tf.get(5402)}"
