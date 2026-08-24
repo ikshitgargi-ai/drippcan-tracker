@@ -22987,7 +22987,11 @@ def _attribution_for(store_number, listing_date, touch_first):
     if listing_date <= LAUNCH_DATE:
         return 'baseline'
     first = touch_first.get(int(store_number))
-    if first and first < listing_date:
+    # Inclusive: a touch ON the listing date is still a rep-driven listing.
+    # This matches _anu_listing_class's claim_date <= listing_date, so the
+    # reconcile and the invoice agree at the same-day boundary instead of one
+    # calling it billable and the other organic.
+    if first and first <= listing_date:
         return 'rep_converted'
     return 'organic'
 
@@ -24798,18 +24802,22 @@ def api_admin_clean_store_reps():
 
 def _dripp_billing_reconcile(db):
     """Prove every post-launch listing has a billing disposition, so none is
-    silently unpaid.
+    silently unpaid. Hardened after an adversarial audit found three ways a
+    billable listing could escape:
 
-    The billables endpoint iterates only stores in anu_accounts (stores Anu
-    claimed). A listing in the ledger at a store that was never claimed is
-    gathered but never counted, so a rep-driven listing at an unclaimed store
-    is money left on the table with no error anywhere. This reconciliation
-    reads the ledger directly (the source of truth) and classifies every
-    post-launch listing, flagging the ones that qualify to bill but are not
-    being counted.
+      1. A rep-driven listing at a store never claimed in anu_accounts is
+         gathered by the billables endpoint but never counted.
+      2. The reconcile and the invoice used different touch anchors, so a
+         claimed store the invoice quietly drops (its claimed_at landing AFTER
+         the listing, e.g. a future-dated visit_date) still read as billed.
+      3. A store x SKU that is Listed in the latest SOD after launch but has NO
+         LISTED event in the ledger is invisible to both the invoice and this
+         check.
+
+    So this now mirrors the invoice's own classifier for claimed stores, and
+    adds a ledger-completeness pass against live SOD.
     """
     launch = LAUNCH_DATE
-    # every store x SKU ever LISTED, earliest date (a listing bills once)
     earliest = {}
     for sn, sku, odate in db_fetchall(
             "SELECT store_number, sku, MIN(CAST(observed_date AS TEXT)) "
@@ -24819,55 +24827,120 @@ def _dripp_billing_reconcile(db):
             continue
         earliest[(int(sn), str(sku))] = str(odate)[:10] if odate else ''
 
-    claimed = {int(r[0]) for r in db_fetchall(
-        "SELECT DISTINCT store_number FROM anu_accounts") if r[0] is not None}
+    # Per-store claim date (what the INVOICE actually anchors billing on), not
+    # just membership, so we can run the invoice's own classifier here.
+    claimed_at = {}
+    for r in db_fetchall("SELECT store_number, MIN(CAST(claimed_at AS TEXT)) "
+                         "FROM anu_accounts GROUP BY store_number"):
+        if r[0] is not None:
+            claimed_at[int(r[0])] = str(r[1])[:10] if r[1] else ''
     overrides = _billing_overrides_active(db)
     touch_first = _first_touchpoints()
 
     buckets = {'billed': 0, 'billed_override': 0, 'baseline': 0,
-               'review_organic': 0, 'leak_billable_unclaimed': 0}
+               'review_organic': 0, 'leak_billable_unclaimed': 0,
+               'leak_invoice_drops_billable': 0, 'ledger_gap': 0}
     leaks, review = [], []
     for (sn, sku), d in earliest.items():
+        brand = SOD_TRACKED_SKUS.get(sku, ('', ''))[0]
         if (sn, sku) in overrides:
             buckets['billed_override'] += 1
             continue
         attr = _attribution_for(sn, d, touch_first)   # baseline|rep_converted|organic
         if attr == 'baseline':
             buckets['baseline'] += 1
-        elif attr == 'rep_converted':
-            if sn in claimed:
+            continue
+        if sn in claimed_at:
+            # Mirror the invoice exactly: it bills only when the claim date is
+            # on or before the listing date. A rep touch preceded the listing
+            # (attr says rep_converted) but the claim is dated later, so the
+            # invoice returns listed_before_touch and never bills it. That is a
+            # real, silent loss the old check missed by trusting membership.
+            cls = _anu_listing_class(d, claimed_at[sn])
+            if cls == 'billable':
                 buckets['billed'] += 1
-            else:
-                # A rep touched this store before it listed, so it should bill,
-                # but the store is not in anu_accounts, so the billables count
-                # misses it. This is the leak.
-                buckets['leak_billable_unclaimed'] += 1
+            elif attr == 'rep_converted':
+                buckets['leak_invoice_drops_billable'] += 1
                 leaks.append({'store_number': sn, 'sku': sku, 'listed': d,
-                              'brand': SOD_TRACKED_SKUS.get(sku, ('', ''))[0],
-                              'reason': 'rep touched before listing but store not claimed'})
-        else:  # organic: listed with no prior touch
+                              'brand': brand, 'claimed_at': claimed_at[sn],
+                              'reason': 'rep touched before listing but the claim '
+                                        'date is later, so the invoice drops it'})
+            else:
+                buckets['review_organic'] += 1
+        elif attr == 'rep_converted':
+            buckets['leak_billable_unclaimed'] += 1
+            leaks.append({'store_number': sn, 'sku': sku, 'listed': d,
+                          'brand': brand,
+                          'reason': 'rep touched before listing but store not claimed'})
+        else:  # organic, unclaimed
             buckets['review_organic'] += 1
-            if sn not in claimed:
-                review.append({'store_number': sn, 'sku': sku, 'listed': d,
-                               'brand': SOD_TRACKED_SKUS.get(sku, ('', ''))[0],
-                               'reason': 'listed after launch, no rep touch on record'})
+            review.append({'store_number': sn, 'sku': sku, 'listed': d,
+                           'brand': brand,
+                           'reason': 'listed after launch, no rep touch on record'})
+
+    # Ledger completeness: anything Listed in the freshest SOD, after launch,
+    # for a tracked SKU, that produced NO LISTED ledger event. The invoice and
+    # the buckets both read the ledger, so a listing missing from it is unpaid
+    # AND uncounted. This is the deepest leak.
+    ledger_gaps = []
+    latest = (row_to_dict(db_fetchone(
+        "SELECT MAX(snapshot_date) AS d FROM sod_inventory") or {}) or {}).get('d')
+    if latest and str(latest)[:10] > launch:
+        phs = ','.join(['%s' if USE_POSTGRES else '?'] * len(SOD_TRACKED_SKUS))
+        ph = '%s' if USE_POSTGRES else '?'
+        for r in db_fetchall(
+                f"SELECT store_number, sku FROM sod_inventory "
+                f"WHERE snapshot_date={ph} AND status='L' AND sku IN ({phs})",
+                [latest] + list(SOD_TRACKED_SKUS.keys())):
+            rd = row_to_dict(r)
+            key = (int(rd['store_number']), str(rd['sku']))
+            if key not in earliest:
+                buckets['ledger_gap'] += 1
+                ledger_gaps.append({'store_number': key[0], 'sku': key[1],
+                                    'brand': SOD_TRACKED_SKUS.get(key[1], ('', ''))[0],
+                                    'reason': 'Listed in SOD after launch but no '
+                                              'LISTED ledger event; run /api/listings/rebuild'})
+
+    # Pre-launch stores that delisted then genuinely re-listed after launch:
+    # the earliest-LISTED convention baselines them, but a rep-driven relist may
+    # be billable. Surface for the founder to decide; billing is not changed.
+    relisted = []
+    for (sn, sku), d in earliest.items():
+        if d and d <= launch:
+            ev = db_fetchall(
+                "SELECT event, CAST(observed_date AS TEXT) FROM listing_ledger "
+                "WHERE store_number=" + ('%s' if USE_POSTGRES else '?') +
+                " AND sku=" + ('%s' if USE_POSTGRES else '?') +
+                " ORDER BY observed_date", (sn, sku))
+            seq = [(str(e[0]), str(e[1])[:10]) for e in ev]
+            had_delist = any(e == 'DELISTED' for e, _ in seq)
+            relist_after = any(e == 'LISTED' and dt > launch for e, dt in seq)
+            if had_delist and relist_after:
+                relisted.append({'store_number': sn, 'sku': sku,
+                                 'first_listed': d,
+                                 'reason': 'listed pre-launch, delisted, re-listed '
+                                           'after launch; confirm if billable'})
 
     total = len(earliest)
-    reconciled = len(leaks) == 0
+    reconciled = len(leaks) == 0 and len(ledger_gaps) == 0
     return {
         'launch_date': launch,
+        'snapshot_date': latest,
         'total_listings': total,
         'buckets': buckets,
         'leaks': leaks,
+        'ledger_gaps': ledger_gaps,
         'review': review,
+        'relisted_pre_launch': relisted,
         'reconciled': reconciled,
         'how_to_read': (
-            'leak_billable_unclaimed = a listing that qualifies to bill '
-            '(a rep touched the store before it listed) but the store is not '
-            'in anu_accounts, so the invoice misses it. review_organic = a '
-            'post-launch listing with no rep touch on record; confirm whether '
-            'Anu secured it before writing it off. reconciled is false whenever '
-            'any leak exists.'),
+            'leak_billable_unclaimed = a rep-driven listing at a store not in '
+            'anu_accounts. leak_invoice_drops_billable = a claimed store whose '
+            'claim date lands after the listing, so the invoice will not bill a '
+            'listing a rep actually drove. ledger_gap = Listed in SOD after '
+            'launch with no ledger event, invisible to billing. review_organic '
+            '= post-launch listing with no rep touch; confirm before writing '
+            'off. reconciled is false whenever any leak or ledger gap exists.'),
     }
 
 
