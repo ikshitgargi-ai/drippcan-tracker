@@ -319,7 +319,7 @@ def require_admin_token(fn):
 # separate places per app and they had drifted apart: /api/reps was missing
 # Surya, and NB was missing Vaneet and Ed entirely. Everything below derives
 # from this list so they cannot disagree again.
-ANU_REP_ROSTER = ['Ikshit', 'Namit', 'Surya', 'Vaneet', 'Ed']
+ANU_REP_ROSTER = ['Ikshit', 'Namit', 'Surya', 'Vaneet', 'Kush']
 _REP_MATCH_NAMES = list(ANU_REP_ROSTER)
 
 
@@ -448,8 +448,10 @@ _OWNER_NEUTRAL_ACTORS = frozenset((
 OWNER_REP_LABELS = {
     'Ikshit': 'GTA CENTRAL',
     'Vaneet': 'GTA WEST',
-    'Ed': 'GTA NORTH',
     'Namit': 'GTA EAST',
+    'Surya': 'GTA SOUTH',
+    'Kush': 'GTA NORTH',
+    'Ed': 'GTA NORTH',          # retired rep: historical rows still scrub to a region
     'Ikshit Sharma': 'GTA CENTRAL',
 }
 _OWNER_REP_LABELS_LOWER = {k.lower(): v for k, v in OWNER_REP_LABELS.items()}
@@ -13967,9 +13969,26 @@ def api_admin_integrity():
     except Exception as e:
         out['source_health'] = {'error': str(e)[:100]}
 
+    # D. Billing reconciliation: no listing may go unpaid without a reason.
+    try:
+        rec = _dripp_billing_reconcile(get_db())
+        out['billing_reconcile'] = {
+            'reconciled': rec['reconciled'],
+            'total_listings': rec['total_listings'],
+            'leaks': len(rec['leaks']),
+            'review_organic': len(rec['review']),
+        }
+        out['checks']['billing_reconciled'] = (
+            'PASS' if rec['reconciled']
+            else f"FAIL: {len(rec['leaks'])} billable listing(s) at unclaimed "
+                 f"stores are not being counted. See /api/billing/reconcile.")
+    except Exception as e:
+        out['checks']['billing_reconciled'] = f'ERROR: {str(e)[:120]}'
+
     out['all_clear'] = (
         out['counts']['listings_without_ledger'] == 0
         and out['counts']['ledger_orphans'] == 0
+        and out.get('billing_reconcile', {}).get('reconciled', True)
         and 'error' not in by_status)
     return jsonify(out)
 
@@ -24775,6 +24794,89 @@ def api_admin_clean_store_reps():
     return jsonify({'status': 'ok', 'normalized_ikshit_sharma': normalized,
                     'cleared_stray': cleared,
                     'remaining_reps': [r[0] for r in remaining]})
+
+
+def _dripp_billing_reconcile(db):
+    """Prove every post-launch listing has a billing disposition, so none is
+    silently unpaid.
+
+    The billables endpoint iterates only stores in anu_accounts (stores Anu
+    claimed). A listing in the ledger at a store that was never claimed is
+    gathered but never counted, so a rep-driven listing at an unclaimed store
+    is money left on the table with no error anywhere. This reconciliation
+    reads the ledger directly (the source of truth) and classifies every
+    post-launch listing, flagging the ones that qualify to bill but are not
+    being counted.
+    """
+    launch = LAUNCH_DATE
+    # every store x SKU ever LISTED, earliest date (a listing bills once)
+    earliest = {}
+    for sn, sku, odate in db_fetchall(
+            "SELECT store_number, sku, MIN(CAST(observed_date AS TEXT)) "
+            "FROM listing_ledger WHERE event='LISTED' "
+            "GROUP BY store_number, sku"):
+        if sn is None or not sku:
+            continue
+        earliest[(int(sn), str(sku))] = str(odate)[:10] if odate else ''
+
+    claimed = {int(r[0]) for r in db_fetchall(
+        "SELECT DISTINCT store_number FROM anu_accounts") if r[0] is not None}
+    overrides = _billing_overrides_active(db)
+    touch_first = _first_touchpoints()
+
+    buckets = {'billed': 0, 'billed_override': 0, 'baseline': 0,
+               'review_organic': 0, 'leak_billable_unclaimed': 0}
+    leaks, review = [], []
+    for (sn, sku), d in earliest.items():
+        if (sn, sku) in overrides:
+            buckets['billed_override'] += 1
+            continue
+        attr = _attribution_for(sn, d, touch_first)   # baseline|rep_converted|organic
+        if attr == 'baseline':
+            buckets['baseline'] += 1
+        elif attr == 'rep_converted':
+            if sn in claimed:
+                buckets['billed'] += 1
+            else:
+                # A rep touched this store before it listed, so it should bill,
+                # but the store is not in anu_accounts, so the billables count
+                # misses it. This is the leak.
+                buckets['leak_billable_unclaimed'] += 1
+                leaks.append({'store_number': sn, 'sku': sku, 'listed': d,
+                              'brand': SOD_TRACKED_SKUS.get(sku, ('', ''))[0],
+                              'reason': 'rep touched before listing but store not claimed'})
+        else:  # organic: listed with no prior touch
+            buckets['review_organic'] += 1
+            if sn not in claimed:
+                review.append({'store_number': sn, 'sku': sku, 'listed': d,
+                               'brand': SOD_TRACKED_SKUS.get(sku, ('', ''))[0],
+                               'reason': 'listed after launch, no rep touch on record'})
+
+    total = len(earliest)
+    reconciled = len(leaks) == 0
+    return {
+        'launch_date': launch,
+        'total_listings': total,
+        'buckets': buckets,
+        'leaks': leaks,
+        'review': review,
+        'reconciled': reconciled,
+        'how_to_read': (
+            'leak_billable_unclaimed = a listing that qualifies to bill '
+            '(a rep touched the store before it listed) but the store is not '
+            'in anu_accounts, so the invoice misses it. review_organic = a '
+            'post-launch listing with no rep touch on record; confirm whether '
+            'Anu secured it before writing it off. reconciled is false whenever '
+            'any leak exists.'),
+    }
+
+
+@app.route('/api/billing/reconcile', methods=['GET'])
+def api_billing_reconcile():
+    """No listing goes unpaid: every post-launch listing, and whether it is
+    billed, legitimately non-billable, or leaking."""
+    db = get_db()
+    return jsonify(_dripp_billing_reconcile(db))
 
 
 @app.route('/api/anu-accounts', methods=['GET'])

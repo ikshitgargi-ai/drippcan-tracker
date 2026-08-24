@@ -122,6 +122,8 @@ def seeded(app_module, ingested):
                 "SELECT id FROM stores WHERE store_number=?", (sn,)).fetchone()
         return row[0]
 
+    # Ed retired from the roster but his history must survive (never deleted).
+    db.execute("INSERT OR IGNORE INTO reps (name) VALUES ('Ed')"); db.commit()
     ed_id = db.execute("SELECT id FROM reps WHERE name='Ed'").fetchone()[0]
     stale_id = db.execute(
         "SELECT id FROM reps WHERE name='Ikshit Sharma'").fetchone()[0]
@@ -309,7 +311,7 @@ class TestRosterHygiene:
     def test_stale_row_stays_in_db_but_out_of_api_reps(self, ingested, seeded, client):
         body = client.get('/api/reps').get_json()
         names = {r['name'] for r in body}
-        assert names == {'Ikshit', 'Namit', 'Surya', 'Vaneet', 'Ed'}
+        assert names == {'Ikshit', 'Namit', 'Surya', 'Vaneet', 'Kush'}   # Ed retired, Kush active
         assert 'Ikshit Sharma' not in names
         # NOTHING deleted: the legacy row is still in the table
         db = _db()
@@ -322,19 +324,23 @@ class TestRosterHygiene:
         body = client.get('/api/crm/reps-with-stores').get_json()
         reps = {r['rep'] for r in body}
         assert 'Ikshit Sharma' not in reps
-        assert 'Ed' in reps  # real roster assignments still counted
+        assert 'Ed' not in reps    # Ed retired: filtered from active views
+        # but his row is preserved in the DB (nothing is ever deleted)
+        _db2 = _db()
+        assert _db2.execute("SELECT COUNT(*) FROM reps WHERE name='Ed'").fetchone()[0] == 1
+        _db2.close()
 
     def test_rep_performance_is_roster_only(self, ingested, seeded, client):
         body = client.get('/api/crm/rep-performance?days=30&nocache=1').get_json()
         reps = [e['rep'] for e in body['reps']]
-        assert sorted(reps) == sorted(['Ikshit', 'Namit', 'Surya', 'Vaneet', 'Ed'])
+        assert sorted(reps) == sorted(['Ikshit', 'Namit', 'Surya', 'Vaneet', 'Kush'])   # Ed retired, Kush active
         assert 'Ikshit Sharma' not in reps
 
     def test_dashboard_by_rep_excludes_stale(self, ingested, seeded, client):
         body = client.get('/api/dashboard').get_json()
         names = set(body['by_rep'].keys())
         assert 'Ikshit Sharma' not in names
-        assert names == {'Ikshit', 'Namit', 'Surya', 'Vaneet', 'Ed'}
+        assert names == {'Ikshit', 'Namit', 'Surya', 'Vaneet', 'Kush'}   # Ed retired, Kush active
 
 
 class TestBackupCompleteness:
@@ -445,6 +451,7 @@ class TestRetentionGuard:
         db = _db()
         before = db.execute("SELECT COUNT(*) FROM activities").fetchone()[0]
         store_id = db.execute("SELECT id FROM stores LIMIT 1").fetchone()[0]
+        db.execute("INSERT OR IGNORE INTO reps (name) VALUES ('Ed')"); db.commit()
         rep_id = db.execute("SELECT id FROM reps WHERE name='Ed'").fetchone()[0]
         db.close()
         assert before >= 1  # seeded fixture planted activity rows
