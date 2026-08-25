@@ -229,3 +229,37 @@ class TestClean:
             db.commit()
             tf = app_module._first_touchpoints()
         assert tf.get(6202) == '2026-07-19', f"got {tf.get(6202)}"
+
+
+class TestRelistBillsAutomatically:
+    """Standing rule (CEO): a rep-driven post-launch re-listing of a lapsed
+    store bills automatically, no override needed (the #390 case)."""
+
+    def test_pre_launch_delist_relist_after_launch_bills(self, app_module, client):
+        _fresh(app_module)
+        _store(app_module, 6301)
+        _touch(app_module, 6301, 'store_visit', when='2026-07-20')
+        # listed pre-launch, delisted, then rep-driven relist after launch
+        _listing(app_module, 6301, '2026-07-05')            # pre-launch
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute("INSERT INTO listing_ledger (sku, store_number, event, "
+                       "observed_date, source, source_detail) VALUES "
+                       "(?,6301,'DELISTED','2026-07-12','sod','t')", (PHX,))
+            db.commit()
+        _listing(app_module, 6301, '2026-07-24')            # post-launch relist
+        _stock(app_module, 6301)
+        r = client.get('/api/billing/reconcile').get_json()
+        assert r['buckets']['billed'] >= 1, 'a rep-driven post-launch relist must bill'
+        assert 6301 not in {l['store_number'] for l in r['leaks']}
+        assert r['reconciled'] is True
+
+    def test_pure_baseline_still_does_not_bill(self, app_module, client):
+        _fresh(app_module)
+        _store(app_module, 6302)
+        _touch(app_module, 6302)
+        _listing(app_module, 6302, '2026-07-05')            # pre-launch, never relisted
+        _stock(app_module, 6302)
+        r = client.get('/api/billing/reconcile').get_json()
+        assert r['buckets']['baseline'] >= 1
+        assert r['buckets']['billed'] == 0

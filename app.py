@@ -24818,6 +24818,46 @@ def api_admin_clean_store_reps():
                     'remaining_reps': [r[0] for r in remaining]})
 
 
+def _post_launch_listed_keys(db, launch):
+    """(store, SKU) whose listing counts as a post-launch placement: either the
+    first-ever LISTED is after launch, OR our product delisted and was re-listed
+    after launch. A rep-driven recovery of a store that had lapsed is a new
+    placement we earned, not the brand's pre-launch baseline, so it bills.
+    """
+    seq = {}
+    for sn, sku, ev, od in db_fetchall(
+            "SELECT store_number, sku, event, CAST(observed_date AS TEXT) "
+            "FROM listing_ledger WHERE event IN ('LISTED','DELISTED') "
+            "ORDER BY observed_date"):
+        if sn is None or not sku:
+            continue
+        seq.setdefault((int(sn), str(sku)), []).append((str(ev), str(od)[:10]))
+    keys = {}
+    for k, evs in seq.items():
+        listed = [d for e, d in evs if e == 'LISTED']
+        if not listed:
+            continue
+        first = min(listed)
+        if first > launch:
+            keys[k] = first
+            continue
+        # pre-launch first listing: qualifies only if a post-launch LISTED
+        # follows a DELISTED (a genuine delist-then-relist), and the relist date
+        # is the effective billable date.
+        had_delist = False
+        for e, d in evs:
+            if e == 'DELISTED':
+                had_delist = True
+            elif e == 'LISTED' and had_delist and d > launch:
+                keys[k] = d
+                break
+    return keys
+
+
+def _post_launch_listed_keys_set(db, launch):
+    return set(_post_launch_listed_keys(db, launch).keys())
+
+
 def _has_inventory_keys(db):
     """(store, sku) pairs where our product currently has inventory, by either
     source: the latest SOD snapshot (Listed, or on-hand > 0) OR the most recent
@@ -24912,6 +24952,7 @@ def _dripp_billing_reconcile(db):
     touch_first = _first_touchpoints()
 
     inv_keys = _has_inventory_keys(db)   # (store, sku) with current SOD/lcbo stock
+    pl_keys = _post_launch_listed_keys_set(db, launch)  # first-after-launch OR post-launch relist
     buckets = {'billed': 0, 'billed_override': 0, 'baseline': 0,
                'no_inventory': 0, 'review_no_touch': 0,
                'leak_billable_unclaimed': 0, 'ledger_gap': 0}
@@ -24931,7 +24972,7 @@ def _dripp_billing_reconcile(db):
                               'reason': 'founder override on a store not in '
                                         'anu_accounts; the invoice will not bill it'})
             continue
-        post_launch = bool(d) and d > launch
+        post_launch = (sn, sku) in pl_keys   # first-after-launch OR post-launch relist
         has_inv = (sn, sku) in inv_keys
         claimed = sn in claimed_at
         touched = claimed or (sn, sku) in rep_sourced   # any touch, incl saw-on-shelf
@@ -25035,14 +25076,9 @@ def _dripp_billing_reconcile(db):
                         'reason': 'listed pre-launch, delisted, re-listed after '
                                   'launch' + (' on rep work' if rep_drove else '')}
                 relisted.append(item)
-                if rep_drove and (sn, sku) not in overrides:
-                    # A rep drove a genuine post-launch re-listing. The earliest
-                    # -date convention baselines it, so it is unpaid. Surface as
-                    # a leak so the gate does not read clean over real money.
-                    buckets['leak_relist_unbilled'] = buckets.get('leak_relist_unbilled', 0) + 1
-                    leaks.append({**item, 'reason': 'rep drove a post-launch '
-                                  're-listing but the earliest-date rule baselines '
-                                  'it, so the invoice never bills it'})
+                # Advisory only: a rep-driven post-launch re-listing now bills
+                # automatically through the main loop (it is a post-launch
+                # placement), so this list is a record, not a leak.
 
     total = len(earliest)
     reconciled = len(leaks) == 0 and len(ledger_gaps) == 0
@@ -25192,6 +25228,7 @@ def api_anu_accounts():
 
     _ovr_billable = _billing_overrides_active(db)
     _inv_keys = _has_inventory_keys(db)   # (store, sku) with current SOD/lcbo.com stock
+    _pl_keys = _post_launch_listed_keys(db, LAUNCH_DATE)  # first-listing-after-launch OR post-launch relist
     rows = []
     total_billable = 0
     with_billable = with_order = 0
@@ -25208,16 +25245,16 @@ def api_anu_accounts():
         listings = []
         billable = 0
         for ev in listings_by_store.get(sn, []):
-            _d = str(ev['date'] or '')
-            _post_launch = bool(_d) and _d > LAUNCH_DATE
+            _pl_date = _pl_keys.get((sn, ev['sku']))   # None unless a post-launch placement
             _has_inv = (sn, ev['sku']) in _inv_keys
-            if not _d or _d <= LAUNCH_DATE:
-                cls = 'baseline'                 # listed on/before launch: theirs
+            if _pl_date is None:
+                cls = 'baseline'                 # only ever listed on/before launch: theirs
             elif _has_inv:
-                cls = 'billable'                 # touched + post-launch + stocked
+                cls = 'billable'                 # touched + post-launch (incl relist) + stocked
+                if _pl_date > str(ev['date'] or ''):
+                    ev = dict(ev, date=_pl_date)  # bill against the relist date
             else:
-                cls = 'no_inventory'             # listed post-launch but not on
-                                                 # any shelf now: not billed yet
+                cls = 'no_inventory'             # post-launch listing but no shelf stock now
             if (sn, ev['sku']) in _ovr_billable:
                 cls = 'manual_override'   # founder's call, on the record
             listings.append({
