@@ -240,19 +240,38 @@ class TestRelistBillsAutomatically:
         _store(app_module, 6301)
         _touch(app_module, 6301, 'store_visit', when='2026-07-20')
         # listed pre-launch, delisted, then rep-driven relist after launch
-        _listing(app_module, 6301, '2026-07-05')            # pre-launch
+        _listing(app_module, 6301, '2026-06-20')            # pre-launch
         with app_module.app.app_context():
             db = app_module.get_db()
             db.execute("INSERT INTO listing_ledger (sku, store_number, event, "
                        "observed_date, source, source_detail) VALUES "
-                       "(?,6301,'DELISTED','2026-07-12','sod','t')", (PHX,))
+                       "(?,6301,'DELISTED','2026-06-25','sod','t')", (PHX,))
             db.commit()
-        _listing(app_module, 6301, '2026-07-24')            # post-launch relist
+        _listing(app_module, 6301, '2026-07-24')            # relist, ~30-day gap
         _stock(app_module, 6301)
         r = client.get('/api/billing/reconcile').get_json()
         assert r['buckets']['billed'] >= 1, 'a rep-driven post-launch relist must bill'
         assert 6301 not in {l['store_number'] for l in r['leaks']}
         assert r['reconciled'] is True
+
+    def test_short_flicker_is_not_a_relist(self, app_module, client):
+        # A 1-day SOD status blip (L->D->L) is not a re-won placement: the
+        # store stays baseline and does not bill even if touched and stocked.
+        _fresh(app_module)
+        _store(app_module, 6303)
+        _touch(app_module, 6303)
+        _listing(app_module, 6303, '2026-07-05')            # pre-launch
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute("INSERT INTO listing_ledger (sku, store_number, event, "
+                       "observed_date, source, source_detail) VALUES "
+                       "(?,6303,'DELISTED','2026-07-23','sod','t')", (PHX,))
+            db.commit()
+        _listing(app_module, 6303, '2026-07-24')            # 1-day blip, not a relist
+        _stock(app_module, 6303)
+        r = client.get('/api/billing/reconcile').get_json()
+        assert r['buckets']['baseline'] >= 1
+        assert 6303 not in {x['store_number'] for x in r.get('review', [])}
 
     def test_pure_baseline_still_does_not_bill(self, app_module, client):
         _fresh(app_module)

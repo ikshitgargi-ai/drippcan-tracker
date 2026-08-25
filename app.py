@@ -24818,12 +24818,22 @@ def api_admin_clean_store_reps():
                     'remaining_reps': [r[0] for r in remaining]})
 
 
+# A relist only counts as a re-won placement if our product was genuinely gone
+# for a while, not a one or two day SOD status blip as stock moves. LCBO SOD
+# flips a store to 'D' briefly all the time; treating every such flicker as a
+# relist would reclassify the brand's baseline stores and risk over-billing a
+# store that was always theirs.
+_RELIST_MIN_GAP_DAYS = 14
+
+
 def _post_launch_listed_keys(db, launch):
     """(store, SKU) whose listing counts as a post-launch placement: either the
-    first-ever LISTED is after launch, OR our product delisted and was re-listed
-    after launch. A rep-driven recovery of a store that had lapsed is a new
-    placement we earned, not the brand's pre-launch baseline, so it bills.
+    first-ever LISTED is after launch, OR our product was delisted for at least
+    _RELIST_MIN_GAP_DAYS and then re-listed after launch. A rep-driven recovery
+    of a store that genuinely lapsed is a placement we earned, not the brand's
+    pre-launch baseline. Value is the effective (relist) date.
     """
+    from datetime import date as _date
     seq = {}
     for sn, sku, ev, od in db_fetchall(
             "SELECT store_number, sku, event, CAST(observed_date AS TEXT) "
@@ -24832,6 +24842,13 @@ def _post_launch_listed_keys(db, launch):
         if sn is None or not sku:
             continue
         seq.setdefault((int(sn), str(sku)), []).append((str(ev), str(od)[:10]))
+
+    def _gap(a, b):
+        try:
+            return (_date.fromisoformat(b) - _date.fromisoformat(a)).days
+        except Exception:
+            return 0
+
     keys = {}
     for k, evs in seq.items():
         listed = [d for e, d in evs if e == 'LISTED']
@@ -24841,14 +24858,14 @@ def _post_launch_listed_keys(db, launch):
         if first > launch:
             keys[k] = first
             continue
-        # pre-launch first listing: qualifies only if a post-launch LISTED
-        # follows a DELISTED (a genuine delist-then-relist), and the relist date
-        # is the effective billable date.
-        had_delist = False
+        # pre-launch first listing: qualifies only on a REAL delist-then-relist
+        # after launch — the product was gone for _RELIST_MIN_GAP_DAYS+.
+        last_delist = None
         for e, d in evs:
             if e == 'DELISTED':
-                had_delist = True
-            elif e == 'LISTED' and had_delist and d > launch:
+                last_delist = d
+            elif e == 'LISTED' and last_delist and d > launch \
+                    and _gap(last_delist, d) >= _RELIST_MIN_GAP_DAYS:
                 keys[k] = d
                 break
     return keys
