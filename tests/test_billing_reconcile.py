@@ -1,6 +1,10 @@
-"""No listing goes unpaid: the reconciliation must catch a billable listing
-that the anu-accounts count would miss, and must not cry wolf on legitimate
-non-billables."""
+"""No listing goes unpaid.
+
+Rule (CEO): a store is billable when a rep TOUCHED it (any activity type puts
+it in anu_accounts) AND our product has inventory there now (SOD or lcbo.com),
+for a post-launch listing. The reconcile proves every such listing is counted,
+and flags any that qualifies but is not being billed.
+"""
 import os
 import sys
 import tempfile
@@ -34,271 +38,194 @@ def client(app_module):
     return app_module.app.test_client()
 
 
-def _seed(app_module):
+def _fresh(app_module):
     with app_module.app.app_context():
         db = app_module.get_db()
-        app_module._ensure_anu_accounts(db) if hasattr(app_module, '_ensure_anu_accounts') else None
-        for sn in (4101, 4102, 4103, 4104):
-            db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
-                       "VALUES (?,?, 'Toronto')", (sn, f'LCBO #{sn}'))
-            db.execute("INSERT OR IGNORE INTO reps (name) VALUES ('Namit')")
-        rid = db.execute("SELECT id FROM reps WHERE name='Namit'").fetchone()[0]
-
-        def touch(sn, when):
-            sid = db.execute("SELECT id FROM stores WHERE store_number=?", (sn,)).fetchone()[0]
-            db.execute("INSERT INTO activities (store_id, rep_id, activity_type, "
-                       "rep, created_at) VALUES (?,?,?,?,?)",
-                       (sid, rid, 'store_visit', 'Namit', when + ' 09:00:00'))
-
-        def listing(sn, date):
-            db.execute("INSERT INTO listing_ledger (sku, store_number, event, "
-                       "observed_date, source, source_detail) VALUES "
-                       "(?,?, 'LISTED', ?, 'sod', 't')", (PHX, sn, date))
-
-        def claim(sn, when):
-            db.execute("INSERT OR IGNORE INTO anu_accounts (store_number, "
-                       "account_ref, claimed_at, first_touch_type) VALUES "
-                       "(?,?,?, 'store_visit')", (sn, f'ANU-{sn}', when))
-
-        # 4101: touched before listing AND claimed -> billed, fine
-        touch(4101, '2026-07-20'); listing(4101, '2026-07-25'); claim(4101, '2026-07-20 09:00:00')
-        # 4102: touched before listing but NOT claimed -> THE LEAK
-        touch(4102, '2026-07-20'); listing(4102, '2026-07-25')
-        # 4103: listed with no touch (organic), not claimed -> review, not leak
-        listing(4103, '2026-07-25')
-        # 4104: baseline (listed on/before launch) -> not billable, fine
-        listing(4104, '2026-07-10')
+        for t in ('listing_ledger', 'anu_accounts', 'activities',
+                  'sod_inventory', 'sod_store_sku_changes', 'lcbo_live_snapshots'):
+            try:
+                db.execute(f"DELETE FROM {t}")
+            except Exception:
+                pass
         db.commit()
 
 
-class TestReconcileCatchesTheLeak:
-    def test_a_billable_listing_at_an_unclaimed_store_is_flagged(self, app_module, client):
-        _seed(app_module)
-        r = client.get('/api/billing/reconcile').get_json()
-        assert r['reconciled'] is False, 'a leak must fail reconciliation'
-        leak_stores = {l['store_number'] for l in r['leaks']}
-        assert 4102 in leak_stores, 'the touched-but-unclaimed listing must leak'
-        assert 4101 not in leak_stores, 'a claimed billable is not a leak'
-        assert 4104 not in leak_stores, 'a pre-launch baseline is not a leak'
+def _store(app_module, sn, city='Toronto'):
+    with app_module.app.app_context():
+        db = app_module.get_db()
+        db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
+                   "VALUES (?,?,?)", (sn, f'LCBO #{sn}', city))
+        db.commit()
 
-    def test_organic_is_review_not_leak(self, app_module, client):
-        r = client.get('/api/billing/reconcile').get_json()
-        review = {x['store_number'] for x in r['review']}
-        leaks = {x['store_number'] for x in r['leaks']}
-        assert 4103 in review and 4103 not in leaks
 
-    def test_every_listing_has_a_disposition(self, app_module, client):
-        r = client.get('/api/billing/reconcile').get_json()
-        b = r['buckets']
-        accounted = (b['billed'] + b['billed_override'] + b['baseline']
-                     + b['review_organic'] + b['leak_billable_unclaimed'])
-        assert accounted == r['total_listings'], 'no listing may be dropped'
+def _touch(app_module, sn, atype='store_visit', when='2026-07-18'):
+    """Any activity type is a touch and claims the store into anu_accounts."""
+    with app_module.app.app_context():
+        db = app_module.get_db()
+        db.execute("INSERT OR IGNORE INTO reps (name) VALUES ('Namit')")
+        rid = db.execute("SELECT id FROM reps WHERE name='Namit'").fetchone()[0]
+        sid = db.execute("SELECT id FROM stores WHERE store_number=?", (sn,)).fetchone()[0]
+        db.execute("INSERT INTO activities (store_id, rep_id, activity_type, rep, "
+                   "created_at, visit_date) VALUES (?,?,?,?, ?, ?)",
+                   (sid, rid, atype, 'Namit', when + ' 14:00:00', when))
+        # a touch claims the store into anu_accounts (any activity type does)
+        app_module._ANU_ACCOUNTS_READY = False
+        app_module._ensure_anu_accounts(db)
+        db.execute("INSERT OR IGNORE INTO anu_accounts (store_number, account_ref, "
+                   "claimed_at, first_touch_type) VALUES (?,?,?,?)",
+                   (sn, f'ANU-{sn}', when + ' 14:00:00', atype))
+        db.commit()
 
-    def test_integrity_fails_when_a_listing_leaks(self, app_module, client):
+
+def _listing(app_module, sn, date='2026-07-25', source='sod'):
+    with app_module.app.app_context():
+        db = app_module.get_db()
+        db.execute("INSERT INTO listing_ledger (sku, store_number, event, "
+                   "observed_date, source, source_detail) VALUES "
+                   "(?,?, 'LISTED', ?, ?, 't')", (PHX, sn, date, source))
+        db.commit()
+
+
+def _stock(app_module, sn, date='2026-08-01'):
+    with app_module.app.app_context():
+        db = app_module.get_db()
+        db.execute("INSERT INTO sod_inventory (sku, store_number, snapshot_date, "
+                   "status, on_hand, product_name) VALUES (?,?,?, 'L', 6, 'x')",
+                   (PHX, sn, date))
+        db.commit()
+
+
+class TestTheRule:
+    def test_touched_stocked_postlaunch_is_billed(self, app_module, client):
+        _fresh(app_module)
+        _store(app_module, 6001)
+        _touch(app_module, 6001, 'call')      # a call is a touch
+        _listing(app_module, 6001, '2026-07-25')
+        _stock(app_module, 6001)
+        r = client.get('/api/billing/reconcile').get_json()
+        assert r['buckets']['billed'] >= 1
+        assert 6001 not in {l['store_number'] for l in r['leaks']}
+
+    def test_no_inventory_is_not_billed_and_not_a_leak(self, app_module, client):
+        _fresh(app_module)
+        _store(app_module, 6002)
+        _touch(app_module, 6002)
+        _listing(app_module, 6002, '2026-07-25')   # listed, but never stocked
+        r = client.get('/api/billing/reconcile').get_json()
+        assert r['buckets']['no_inventory'] >= 1
+        assert 6002 not in {l['store_number'] for l in r['leaks']}
+        assert r['buckets']['billed'] == 0
+
+    def test_prelaunch_is_baseline(self, app_module, client):
+        _fresh(app_module)
+        _store(app_module, 6003)
+        _touch(app_module, 6003)
+        _listing(app_module, 6003, '2026-07-10')   # on/before launch
+        _stock(app_module, 6003)
+        r = client.get('/api/billing/reconcile').get_json()
+        assert r['buckets']['baseline'] >= 1
+        assert r['buckets']['billed'] == 0
+
+    def test_stocked_but_untouched_is_review_not_billed(self, app_module, client):
+        _fresh(app_module)
+        _store(app_module, 6004)
+        _listing(app_module, 6004, '2026-07-25')   # listed + stocked, no touch
+        _stock(app_module, 6004)
+        r = client.get('/api/billing/reconcile').get_json()
+        assert 6004 in {x['store_number'] for x in r['review']}
+        assert r['buckets']['billed'] == 0
+
+    def test_lcbo_com_inventory_alone_qualifies(self, app_module, client):
+        _fresh(app_module)
+        _store(app_module, 6005)
+        _touch(app_module, 6005)
+        _listing(app_module, 6005, '2026-07-25')
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute("INSERT INTO lcbo_live_snapshots (sku, store_number, qty, "
+                       "batch_id) VALUES (?,6005,4,'b1')", (PHX,))
+            db.commit()
+        r = client.get('/api/billing/reconcile').get_json()
+        assert r['buckets']['billed'] >= 1, 'lcbo.com stock alone must qualify'
+
+
+class TestLeaksCaught:
+    def test_rep_saw_on_shelf_stocked_unclaimed_is_a_leak(self, app_module, client):
+        _fresh(app_module)
+        _store(app_module, 6101)
+        # a rep tapped "saw on shelf": ledger LISTED source='rep', no activity,
+        # store never claimed; product is on the shelf now.
+        _listing(app_module, 6101, '2026-07-25', source='rep')
+        _stock(app_module, 6101)
+        r = client.get('/api/billing/reconcile').get_json()
+        assert 6101 in {l['store_number'] for l in r['leaks']}
+        assert r['reconciled'] is False
+
+    def test_override_on_unclaimed_store_is_a_leak(self, app_module, client):
+        _fresh(app_module)
+        _store(app_module, 6102)
+        _listing(app_module, 6102, '2026-07-25')
+        _stock(app_module, 6102)
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            try:
+                db.execute("INSERT INTO billing_overrides (store_number, sku, "
+                           "action, reason) VALUES (6102, ?, 'mark_billable', 'x')", (PHX,))
+            except Exception:
+                db.execute("INSERT INTO billing_overrides (store_number, sku, "
+                           "action, reason, created_at) VALUES (6102, ?, "
+                           "'mark_billable', 'x', '2026-07-25')", (PHX,))
+            db.commit()
+        r = client.get('/api/billing/reconcile').get_json()
+        assert 6102 in {l['store_number'] for l in r['leaks']}
+        assert r['reconciled'] is False
+
+    def test_change_log_signal_without_ledger_is_a_gap(self, app_module, client):
+        _fresh(app_module)
+        _store(app_module, 6103)
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute("INSERT INTO sod_store_sku_changes (sku, store_number, "
+                       "change_date, old_status, new_status, change_type) VALUES "
+                       "(?,6103,'2026-07-25',NULL,'L','NEW_LISTING')", (PHX,))
+            db.commit()
+        r = client.get('/api/billing/reconcile').get_json()
+        assert 6103 in {g['store_number'] for g in r['ledger_gaps']}
+        assert r['reconciled'] is False
+
+    def test_integrity_fails_on_a_leak(self, app_module, client):
+        _fresh(app_module)
+        _store(app_module, 6104)
+        _listing(app_module, 6104, '2026-07-25', source='rep')
+        _stock(app_module, 6104)
         j = client.get('/api/admin/integrity').get_json()
         assert j['checks']['billing_reconciled'].startswith('FAIL')
         assert j['all_clear'] is False
 
 
-class TestAuditGapsClosed:
-    """The three unpaid-listing paths an adversarial audit found."""
-
-    def _fresh(self, app_module):
-        with app_module.app.app_context():
-            db = app_module.get_db()
-            db.execute("DELETE FROM listing_ledger")
-            db.execute("DELETE FROM anu_accounts")
-            db.execute("DELETE FROM activities")
-            db.commit()
-
-    def test_same_day_touch_at_unclaimed_store_is_a_leak(self, app_module, client):
-        self._fresh(app_module)
-        with app_module.app.app_context():
-            db = app_module.get_db()
-            db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
-                       "VALUES (5201,'LCBO #5201','Toronto')")
-            db.execute("INSERT OR IGNORE INTO reps (name) VALUES ('Namit')")
-            rid = db.execute("SELECT id FROM reps WHERE name='Namit'").fetchone()[0]
-            sid = db.execute("SELECT id FROM stores WHERE store_number=5201").fetchone()[0]
-            # touch and listing on the SAME day, store not claimed
-            db.execute("INSERT INTO activities (store_id, rep_id, activity_type, rep, "
-                       "created_at) VALUES (?,?,?,?, '2026-07-25 09:00:00')",
-                       (sid, rid, 'store_visit', 'Namit'))
-            db.execute("INSERT INTO listing_ledger (sku, store_number, event, "
-                       "observed_date, source, source_detail) VALUES "
-                       "(?,5201,'LISTED','2026-07-25','sod','t')", (PHX,))
-            db.commit()
+class TestClean:
+    def test_a_clean_book_reconciles(self, app_module, client):
+        _fresh(app_module)
+        _store(app_module, 6201)
+        _touch(app_module, 6201)
+        _listing(app_module, 6201, '2026-07-25')
+        _stock(app_module, 6201)
         r = client.get('/api/billing/reconcile').get_json()
-        assert 5201 in {l['store_number'] for l in r['leaks']}, 'same-day touch must bill'
-        assert r['reconciled'] is False
+        assert r['reconciled'] is True
+        assert len(r['leaks']) == 0 and len(r['ledger_gaps']) == 0
 
-    def test_claimed_store_the_invoice_would_drop_is_a_leak(self, app_module, client):
-        self._fresh(app_module)
-        with app_module.app.app_context():
-            db = app_module.get_db()
-            db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
-                       "VALUES (5202,'LCBO #5202','Toronto')")
-            db.execute("INSERT OR IGNORE INTO reps (name) VALUES ('Namit')")
-            rid = db.execute("SELECT id FROM reps WHERE name='Namit'").fetchone()[0]
-            sid = db.execute("SELECT id FROM stores WHERE store_number=5202").fetchone()[0]
-            # rep genuinely touched on 07-18, before the 07-20 listing
-            db.execute("INSERT INTO activities (store_id, rep_id, activity_type, rep, "
-                       "created_at) VALUES (?,?,?,?, '2026-07-18 09:00:00')",
-                       (sid, rid, 'store_visit', 'Namit'))
-            db.execute("INSERT INTO listing_ledger (sku, store_number, event, "
-                       "observed_date, source, source_detail) VALUES "
-                       "(?,5202,'LISTED','2026-07-20','sod','t')", (PHX,))
-            # but the claim is dated LATER (a future-dated visit), so the invoice
-            # classifier returns listed_before_touch and never bills it
-            db.execute("INSERT OR IGNORE INTO anu_accounts (store_number, account_ref, "
-                       "claimed_at, first_touch_type) VALUES (5202,'ANU-5202',"
-                       "'2026-07-30 00:00:00','store_visit')")
-            db.commit()
-        r = client.get('/api/billing/reconcile').get_json()
-        leak = next((l for l in r['leaks'] if l['store_number'] == 5202), None)
-        assert leak is not None, 'a claimed store the invoice drops must not read as billed'
-        assert r['buckets']['leak_invoice_drops_billable'] >= 1
-        assert r['reconciled'] is False
-
-    def test_listed_in_sod_but_missing_from_ledger_is_a_gap(self, app_module, client):
-        self._fresh(app_module)
-        with app_module.app.app_context():
-            db = app_module.get_db()
-            db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
-                       "VALUES (5203,'LCBO #5203','Toronto')")
-            # Listed in the freshest SOD after launch, but NO ledger event
-            db.execute("INSERT INTO sod_inventory (sku, store_number, snapshot_date, "
-                       "status, on_hand, product_name) VALUES "
-                       "(?,5203,'2026-08-01','L',10,'x')", (PHX,))
-            db.commit()
-        r = client.get('/api/billing/reconcile').get_json()
-        assert 5203 in {g['store_number'] for g in r['ledger_gaps']}, \
-            'a listing in SOD with no ledger event must be surfaced'
-        assert r['reconciled'] is False
-
-
-class TestSecondPassGapsClosed:
-    def _fresh(self, app_module):
-        with app_module.app.app_context():
-            db = app_module.get_db()
-            for t in ('listing_ledger', 'anu_accounts', 'activities',
-                      'sod_store_sku_changes', 'billing_overrides'):
-                try:
-                    db.execute(f"DELETE FROM {t}")
-                except Exception:
-                    pass
-            db.commit()
-
-    def test_override_on_unclaimed_store_is_a_leak(self, app_module, client):
-        self._fresh(app_module)
-        with app_module.app.app_context():
-            db = app_module.get_db()
-            db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
-                       "VALUES (5301,'LCBO #5301','Toronto')")
-            db.execute("INSERT INTO listing_ledger (sku, store_number, event, "
-                       "observed_date, source, source_detail) VALUES "
-                       "(?,5301,'LISTED','2026-07-25','sod','t')", (PHX,))
-            # founder marks it billable, but the store was never claimed
-            app_module._ensure_billing_overrides(db) if hasattr(app_module, '_ensure_billing_overrides') else None
-            try:
-                db.execute("INSERT INTO billing_overrides (store_number, sku, action, "
-                           "reason) VALUES (5301, ?, 'mark_billable', 'known win')", (PHX,))
-            except Exception:
-                db.execute("INSERT INTO billing_overrides (store_number, sku, action, "
-                           "reason, created_at) VALUES (5301, ?, 'mark_billable', 'x', "
-                           "'2026-07-25')", (PHX,))
-            db.commit()
-        r = client.get('/api/billing/reconcile').get_json()
-        assert 5301 in {l['store_number'] for l in r['leaks']}, \
-            'an override the invoice cannot bill must be a leak'
-        assert r['reconciled'] is False
-
-    def test_rep_driven_post_launch_relist_is_a_leak(self, app_module, client):
-        self._fresh(app_module)
-        with app_module.app.app_context():
-            db = app_module.get_db()
-            db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
-                       "VALUES (5302,'LCBO #5302','Toronto')")
-            db.execute("INSERT OR IGNORE INTO reps (name) VALUES ('Namit')")
-            rid = db.execute("SELECT id FROM reps WHERE name='Namit'").fetchone()[0]
-            sid = db.execute("SELECT id FROM stores WHERE store_number=5302").fetchone()[0]
-            # listed pre-launch, delisted, then rep-driven relist after launch
-            for ev, d in (('LISTED','2026-07-01'), ('DELISTED','2026-07-10'),
-                          ('LISTED','2026-07-25')):
-                db.execute("INSERT INTO listing_ledger (sku, store_number, event, "
-                           "observed_date, source, source_detail) VALUES "
-                           "(?,5302,?,?,'sod','t')", (PHX, ev, d))
-            db.execute("INSERT INTO activities (store_id, rep_id, activity_type, rep, "
-                       "created_at, visit_date) VALUES (?,?,?,?, ?, '2026-07-20')",
-                       (sid, rid, 'store_visit', 'Namit', '2026-07-20 09:00:00'))
-            db.commit()
-        r = client.get('/api/billing/reconcile').get_json()
-        assert 5302 in {l['store_number'] for l in r['leaks']}, \
-            'a rep-driven post-launch relist must not be silently baselined'
-        assert r['reconciled'] is False
-
-    def test_churned_listing_in_change_log_is_a_gap(self, app_module, client):
-        self._fresh(app_module)
-        with app_module.app.app_context():
-            db = app_module.get_db()
-            db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
-                       "VALUES (5303,'LCBO #5303','Toronto')")
-            # a post-launch NEW_LISTING in the durable change log, but no LISTED
-            # ledger event (fold failed) and not in the newest snapshot (churned)
-            db.execute("INSERT INTO sod_store_sku_changes (sku, store_number, "
-                       "change_date, old_status, new_status, change_type) VALUES "
-                       "(?,5303,'2026-07-25',NULL,'L','NEW_LISTING')", (PHX,))
-            db.commit()
-        r = client.get('/api/billing/reconcile').get_json()
-        assert 5303 in {g['store_number'] for g in r['ledger_gaps']}, \
-            'a churned post-launch listing must be caught via the change log'
-        assert r['reconciled'] is False
-
-
-class TestThirdPassGapsClosed:
-    """The rule (CEO): a store a rep touched that then gets a listing is
-    billable. These close the last two ways a touched+listed store slipped."""
-
-    def _fresh(self, app_module):
-        with app_module.app.app_context():
-            db = app_module.get_db()
-            for t in ('listing_ledger', 'anu_accounts', 'activities'):
-                db.execute(f"DELETE FROM {t}")
-            db.commit()
-
-    def test_rep_saw_on_shelf_at_unclaimed_store_is_a_leak(self, app_module, client):
-        self._fresh(app_module)
-        with app_module.app.app_context():
-            db = app_module.get_db()
-            db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
-                       "VALUES (5401,'LCBO #5401','Toronto')")
-            # a rep tapped "saw on shelf": ledger LISTED source='rep', no activity,
-            # store never claimed. The invoice would never bill it.
-            db.execute("INSERT INTO listing_ledger (sku, store_number, event, "
-                       "observed_date, source, source_detail) VALUES "
-                       "(?,5401,'LISTED','2026-07-25','rep','saw it')", (PHX,))
-            db.commit()
-        r = client.get('/api/billing/reconcile').get_json()
-        assert 5401 in {l['store_number'] for l in r['leaks']}, \
-            "a rep's saw-on-shelf listing must be billable, not written off"
-        assert r['reconciled'] is False
-
-    def test_evening_touch_is_dated_in_toronto_not_utc(self, app_module):
-        # A 9pm ET touch stored as next-day UTC must still attribute to the ET
-        # day, so a same-ET-day listing counts as rep-driven.
+    def test_evening_touch_dated_in_toronto(self, app_module):
         with app_module.app.app_context():
             db = app_module.get_db()
             db.execute("DELETE FROM activities")
             db.execute("INSERT OR IGNORE INTO stores (store_number, account, city) "
-                       "VALUES (5402,'LCBO #5402','Toronto')")
+                       "VALUES (6202,'LCBO #6202','Toronto')")
             db.execute("INSERT OR IGNORE INTO reps (name) VALUES ('Namit')")
             rid = db.execute("SELECT id FROM reps WHERE name='Namit'").fetchone()[0]
-            sid = db.execute("SELECT id FROM stores WHERE store_number=5402").fetchone()[0]
-            # created_at in UTC that is the next calendar day vs Toronto; no visit_date
+            sid = db.execute("SELECT id FROM stores WHERE store_number=6202").fetchone()[0]
             db.execute("INSERT INTO activities (store_id, rep_id, activity_type, "
                        "created_at) VALUES (?,?,?, '2026-07-20 01:00:00')",
                        (sid, rid, 'store_visit'))
             db.commit()
             tf = app_module._first_touchpoints()
-        # -5h converts 2026-07-20 01:00 UTC to 2026-07-19 20:00 ET
-        assert tf.get(5402) == '2026-07-19', f"expected Toronto date, got {tf.get(5402)}"
+        assert tf.get(6202) == '2026-07-19', f"got {tf.get(6202)}"

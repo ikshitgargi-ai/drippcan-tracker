@@ -5534,6 +5534,16 @@ def _sod_sync_worker(sources):
                 print(f'[SOD] PERMANENT GAPS (unrecoverable): {gap["permanent"]}')
         except Exception as e:
             print(f'[SOD] gap sweep failed: {e}')
+        # Recompute and record the billable position daily, and alarm on any
+        # listing that qualifies to bill but is not being counted.
+        try:
+            _bc = _sod_get_conn()
+            try:
+                _record_dripp_billables_snapshot(_bc)
+            finally:
+                _bc.close()
+        except Exception as e:
+            print(f'[billing] daily billables update failed: {e}')
     finally:
         _sod_sync_lock.release()
 
@@ -13976,7 +13986,7 @@ def api_admin_integrity():
             'reconciled': rec['reconciled'],
             'total_listings': rec['total_listings'],
             'leaks': len(rec['leaks']),
-            'review_organic': len(rec['review']),
+            'review_no_touch': len(rec['review']),
         }
         out['checks']['billing_reconciled'] = (
             'PASS' if rec['reconciled']
@@ -24808,6 +24818,47 @@ def api_admin_clean_store_reps():
                     'remaining_reps': [r[0] for r in remaining]})
 
 
+def _has_inventory_keys(db):
+    """(store, sku) pairs where our product currently has inventory, by either
+    source: the latest SOD snapshot (Listed, or on-hand > 0) OR the most recent
+    lcbo.com live check (qty seen). This is the 'has inventory' half of the
+    billable rule: a store is billed only when a rep touched it (it is in
+    anu_accounts) AND our product is actually on its shelf per SOD or lcbo.com.
+    """
+    keys = set()
+    ph = '%s' if USE_POSTGRES else '?'
+    # Each (store, SKU) judged on ITS OWN latest SOD row, not one global latest
+    # snapshot. In production every store reports every day so the two agree,
+    # but per-store-latest is the correct question and is robust to sparse data.
+    phs = ','.join([ph] * len(SOD_TRACKED_SKUS))
+    for r in db_fetchall(
+            f"SELECT si.store_number, si.sku FROM sod_inventory si "
+            f"WHERE si.sku IN ({phs}) "
+            f"AND si.snapshot_date = (SELECT MAX(si2.snapshot_date) "
+            f"  FROM sod_inventory si2 WHERE si2.store_number=si.store_number "
+            f"  AND si2.sku=si.sku) "
+            f"AND (si.status='L' OR COALESCE(si.on_hand,0) > 0)",
+            list(SOD_TRACKED_SKUS.keys())):
+            rd = row_to_dict(r)
+            if rd.get('store_number') is not None:
+                keys.add((int(rd['store_number']), str(rd['sku'])))
+    # lcbo.com live: the most recent batch per SKU, any qty row seen
+    try:
+        for r in db_fetchall(
+                "SELECT store_number, sku FROM lcbo_live_snapshots l "
+                "WHERE batch_id IN (SELECT batch_id FROM ("
+                "  SELECT sku AS s, MAX(checked_at) AS mx FROM lcbo_live_snapshots "
+                "  GROUP BY sku) t JOIN lcbo_live_snapshots b "
+                "  ON b.sku=t.s AND b.checked_at=t.mx) "
+                "GROUP BY store_number, sku"):
+            rd = row_to_dict(r)
+            if rd.get('store_number') is not None:
+                keys.add((int(rd['store_number']), str(rd['sku'])))
+    except Exception:
+        pass
+    return keys
+
+
 def _dripp_billing_reconcile(db):
     """Prove every post-launch listing has a billing disposition, so none is
     silently unpaid. Hardened after an adversarial audit found three ways a
@@ -24826,6 +24877,10 @@ def _dripp_billing_reconcile(db):
     adds a ledger-completeness pass against live SOD.
     """
     launch = LAUNCH_DATE
+    try:
+        _ensure_anu_accounts(db)   # never 500 if the table has not been made yet
+    except Exception:
+        pass
     earliest = {}
     for sn, sku, odate in db_fetchall(
             "SELECT store_number, sku, MIN(CAST(observed_date AS TEXT)) "
@@ -24856,9 +24911,10 @@ def _dripp_billing_reconcile(db):
     overrides = _billing_overrides_active(db)
     touch_first = _first_touchpoints()
 
+    inv_keys = _has_inventory_keys(db)   # (store, sku) with current SOD/lcbo stock
     buckets = {'billed': 0, 'billed_override': 0, 'baseline': 0,
-               'review_organic': 0, 'leak_billable_unclaimed': 0,
-               'leak_invoice_drops_billable': 0, 'ledger_gap': 0}
+               'no_inventory': 0, 'review_no_touch': 0,
+               'leak_billable_unclaimed': 0, 'ledger_gap': 0}
     leaks, review = [], []
     for (sn, sku), d in earliest.items():
         brand = SOD_TRACKED_SKUS.get(sku, ('', ''))[0]
@@ -24875,46 +24931,34 @@ def _dripp_billing_reconcile(db):
                               'reason': 'founder override on a store not in '
                                         'anu_accounts; the invoice will not bill it'})
             continue
-        attr = _attribution_for(sn, d, touch_first)   # baseline|rep_converted|organic
-        if attr == 'baseline':
-            buckets['baseline'] += 1
-            continue
-        if sn in claimed_at:
-            # Mirror the invoice exactly: it bills only when the claim date is
-            # on or before the listing date. A rep touch preceded the listing
-            # (attr says rep_converted) but the claim is dated later, so the
-            # invoice returns listed_before_touch and never bills it. That is a
-            # real, silent loss the old check missed by trusting membership.
-            cls = _anu_listing_class(d, claimed_at[sn])
-            if cls == 'billable':
-                buckets['billed'] += 1
-            elif attr == 'rep_converted':
-                buckets['leak_invoice_drops_billable'] += 1
-                leaks.append({'store_number': sn, 'sku': sku, 'listed': d,
-                              'brand': brand, 'claimed_at': claimed_at[sn],
-                              'reason': 'rep touched before listing but the claim '
-                                        'date is later, so the invoice drops it'})
-            else:
-                buckets['review_organic'] += 1
-        elif attr == 'rep_converted':
+        post_launch = bool(d) and d > launch
+        has_inv = (sn, sku) in inv_keys
+        claimed = sn in claimed_at
+        touched = claimed or (sn, sku) in rep_sourced   # any touch, incl saw-on-shelf
+        if not post_launch:
+            buckets['baseline'] += 1               # listed on/before launch: theirs
+        elif not has_inv:
+            # Listed after launch but our product is on no shelf now per SOD or
+            # lcbo.com. Not billed (a phantom/stale listing), and not a leak.
+            buckets['no_inventory'] += 1
+        elif claimed:
+            buckets['billed'] += 1                 # touched + post-launch + stocked
+        elif touched:
+            # A rep saw it on the shelf (source='rep') but the store never made
+            # it into anu_accounts, so the invoice, which bills only anu_accounts
+            # stores, misses a stocked post-launch listing a rep drove.
             buckets['leak_billable_unclaimed'] += 1
             leaks.append({'store_number': sn, 'sku': sku, 'listed': d,
                           'brand': brand,
-                          'reason': 'rep touched before listing but store not claimed'})
-        elif (sn, sku) in rep_sourced:
-            # A rep saw it on the shelf (source='rep') but the store was never
-            # claimed, so the invoice never bills it. That is a leak, not review.
-            buckets['leak_billable_unclaimed'] += 1
-            leaks.append({'store_number': sn, 'sku': sku, 'listed': d,
-                          'brand': brand,
-                          'reason': "rep logged 'saw on shelf' but the store is "
-                                    "not in anu_accounts, so the invoice drops it"})
-        else:  # organic, unclaimed, no rep evidence at all
-            buckets['review_organic'] += 1
+                          'reason': "rep saw it on the shelf but the store is not "
+                                    "in anu_accounts, so the invoice drops it"})
+        else:
+            # Stocked, post-launch, but no rep touch at all. Did we secure it?
+            buckets['review_no_touch'] += 1
             review.append({'store_number': sn, 'sku': sku, 'listed': d,
                            'brand': brand,
-                           'reason': 'listed after launch, no rep touch on record'})
-
+                           'reason': 'stocked and listed after launch, but no rep '
+                                     'touch on record'})
     # Ledger completeness: anything Listed in the freshest SOD, after launch,
     # for a tracked SKU, that produced NO LISTED ledger event. The invoice and
     # the buckets both read the ledger, so a listing missing from it is unpaid
@@ -25013,14 +25057,61 @@ def _dripp_billing_reconcile(db):
         'relisted_pre_launch': relisted,
         'reconciled': reconciled,
         'how_to_read': (
-            'leak_billable_unclaimed = a rep-driven listing at a store not in '
-            'anu_accounts. leak_invoice_drops_billable = a claimed store whose '
-            'claim date lands after the listing, so the invoice will not bill a '
-            'listing a rep actually drove. ledger_gap = Listed in SOD after '
-            'launch with no ledger event, invisible to billing. review_organic '
-            '= post-launch listing with no rep touch; confirm before writing '
-            'off. reconciled is false whenever any leak or ledger gap exists.'),
+            'Rule: a store is billable when a rep touched it (it is in '
+            'anu_accounts, from any activity type) AND our product has '
+            'inventory now (SOD or lcbo.com), for a post-launch listing. '
+            'billed = that. no_inventory = listed after launch but on no shelf '
+            'now (not billed, not owed). leak_billable_unclaimed = stocked, '
+            'post-launch, a rep saw it on the shelf, but the store is not in '
+            'anu_accounts so the invoice misses it. review_no_touch = stocked '
+            'and post-launch but no rep touch on record. ledger_gap = a '
+            'post-launch listing signal with no LISTED ledger event. reconciled '
+            'is false whenever any leak or ledger gap exists.'),
     }
+
+
+def _record_dripp_billables_snapshot(conn):
+    """Daily: recompute billables from the latest anu_accounts + inventory and
+    record the position, so there is a dated audit trail and a leak is caught
+    every day, not only when someone opens the page. Cursor-only so a scheduler
+    thread with no Flask context can call it. One row per Toronto day.
+    """
+    try:
+        cur = conn.cursor()
+        pk = 'BIGSERIAL PRIMARY KEY' if USE_POSTGRES else 'INTEGER PRIMARY KEY AUTOINCREMENT'
+        ph = '%s' if USE_POSTGRES else '?'
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS dripp_billable_snapshots (
+            id {pk}, snapshot_date TEXT NOT NULL UNIQUE,
+            billable_count INTEGER NOT NULL, leak_count INTEGER NOT NULL,
+            ledger_gap_count INTEGER NOT NULL, total_listings INTEGER NOT NULL,
+            recorded_at TIMESTAMP DEFAULT {'NOW()' if USE_POSTGRES else "(datetime('now'))"})""")
+        conn.commit()
+        rec = _dripp_billing_reconcile(conn)
+        billed = rec['buckets'].get('billed', 0) + rec['buckets'].get('billed_override', 0)
+        today = _toronto_today().isoformat()
+        verb = 'INSERT INTO' if USE_POSTGRES else 'INSERT OR IGNORE INTO'
+        conflict = 'ON CONFLICT (snapshot_date) DO NOTHING' if USE_POSTGRES else ''
+        cur.execute(
+            f"{verb} dripp_billable_snapshots (snapshot_date, billable_count, "
+            f"leak_count, ledger_gap_count, total_listings) "
+            f"VALUES ({ph},{ph},{ph},{ph},{ph}) {conflict}",
+            (today, billed, len(rec['leaks']), len(rec['ledger_gaps']), rec['total_listings']))
+        conn.commit()
+        if rec['leaks'] or rec['ledger_gaps']:
+            print(f"[billing] {today}: {billed} billable, "
+                  f"{len(rec['leaks'])} LEAK(S), {len(rec['ledger_gaps'])} ledger gap(s) "
+                  f"— see /api/billing/reconcile")
+            try:
+                send_alert(subject='DRIPP BILLING: listings need attention',
+                           body=str({'leaks': rec['leaks'][:20],
+                                     'ledger_gaps': rec['ledger_gaps'][:20]}),
+                           level='warning')
+            except Exception:
+                pass
+        return billed
+    except Exception as e:
+        print(f'[billing] daily snapshot failed: {e}')
+        return None
 
 
 @app.route('/api/billing/reconcile', methods=['GET'])
@@ -25100,6 +25191,7 @@ def api_anu_accounts():
                     "AND owner_status != 'none'")}
 
     _ovr_billable = _billing_overrides_active(db)
+    _inv_keys = _has_inventory_keys(db)   # (store, sku) with current SOD/lcbo.com stock
     rows = []
     total_billable = 0
     with_billable = with_order = 0
@@ -25116,7 +25208,16 @@ def api_anu_accounts():
         listings = []
         billable = 0
         for ev in listings_by_store.get(sn, []):
-            cls = _anu_listing_class(ev['date'], claim)
+            _d = str(ev['date'] or '')
+            _post_launch = bool(_d) and _d > LAUNCH_DATE
+            _has_inv = (sn, ev['sku']) in _inv_keys
+            if not _d or _d <= LAUNCH_DATE:
+                cls = 'baseline'                 # listed on/before launch: theirs
+            elif _has_inv:
+                cls = 'billable'                 # touched + post-launch + stocked
+            else:
+                cls = 'no_inventory'             # listed post-launch but not on
+                                                 # any shelf now: not billed yet
             if (sn, ev['sku']) in _ovr_billable:
                 cls = 'manual_override'   # founder's call, on the record
             listings.append({

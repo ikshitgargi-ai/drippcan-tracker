@@ -82,6 +82,17 @@ def _log(client, store_number, activity_type='store_visit', rep='Ikshit',
     return r.get_json()
 
 
+def _stock(app_module, store, sku, date='2026-08-01'):
+    """Give a store×SKU current inventory so it can bill under the rule
+    'in anu_accounts AND has inventory'. Latest-snapshot SOD, Listed."""
+    with app_module.app.app_context():
+        db = app_module.get_db()
+        db.execute("INSERT INTO sod_inventory (sku, store_number, snapshot_date, "
+                   "status, on_hand, product_name) VALUES (?,?,?, 'L', 6, 'x')",
+                   (sku, store, date))
+        db.commit()
+
+
 def _accounts(client, owner=False):
     headers = {'X-View': 'owner'} if owner else {}
     r = client.get('/api/anu-accounts?nocache=1', headers=headers)
@@ -120,36 +131,40 @@ class TestClaim:
 
 class TestBillingClassification:
     def test_listing_classes(self, seeded, client, app_module):
+        # New rule: billable = the store is in anu_accounts (touched, any type)
+        # AND our SKU has inventory now (SOD or lcbo.com), for a post-launch
+        # listing. Pre-launch = baseline; post-launch with no current inventory
+        # = no_inventory (a phantom/stale listing is not billed).
         with app_module.app.app_context():
             db = app_module.get_db()
             cur = db.cursor()
-            # Baseline: PHOENIX listed before/at launch (2026-07-16).
+            # Baseline: PHOENIX listed on/before launch (2026-07-16).
             app_module._ledger_record(cur, PHOENIX, 901, 'LISTED', 'sod',
                                       'test', '2026-07-13')
-            # Billable: a DIFFERENT SKU (Dayaa) newly listed after our claim.
-            # (Same-SKU re-listing collapses to its earliest date by design —
-            # a SKU already listed at baseline is never re-billed.)
+            # Post-launch DAYAA at a store we touched, WITH inventory -> billable.
             app_module._ledger_record(cur, DAYAA, 901, 'LISTED', 'live',
-                                      'test', '2099-01-01')
-            # listed_before_touch: new listing on a store we touched later.
+                                      'test', '2026-07-20')
+            # Post-launch PHOENIX at 903 but NO current inventory -> no_inventory.
             db.execute(
                 "INSERT OR IGNORE INTO stores (store_number, account, city) "
-                "VALUES (?,?,?)", (903, 'Test Late Touch', 'Vaughan'))
+                "VALUES (?,?,?)", (903, 'Test No Stock', 'Vaughan'))
             app_module._ledger_record(cur, PHOENIX, 903, 'LISTED', 'live',
                                       'test', '2026-07-17')
             db.commit()
-        _log(client, 903, 'store_visit', visit_date='2026-07-20')
+        _log(client, 901, 'call', visit_date='2026-07-16')      # a call is a touch
+        _stock(app_module, 901, DAYAA)                          # inventory for the billable
+        _log(client, 903, 'store_visit', visit_date='2026-07-20')  # touched but no stock
 
         body = _accounts(client)
         r901 = next(r for r in body['rows'] if r['store_number'] == 901)
         classes = {x['date']: x['classification'] for x in r901['listings']}
         assert classes['2026-07-13'] == 'baseline'
-        assert classes['2099-01-01'] == 'billable'
+        assert classes['2026-07-20'] == 'billable'
         assert r901['billable_listings'] == 1
         r903 = next(r for r in body['rows'] if r['store_number'] == 903)
-        assert r903['listings'][0]['classification'] == 'listed_before_touch'
+        assert r903['listings'][0]['classification'] == 'no_inventory'
+        assert r903['billable_listings'] == 0
         assert body['summary']['billable_listings'] >= 1
-        assert body['summary']['accounts'] >= 3
 
 
 class TestOwnerView:
@@ -239,6 +254,7 @@ class TestBillableDedup:
                        "VALUES (?,?,?)", (950, 'Dedup Test', 'Toronto'))
             db.commit()
         _log(client, 950, 'store_visit', visit_date='2026-07-16')
+        _stock(app_module, 950, PHOENIX)
         with app_module.app.app_context():
             db = app_module.get_db()
             cur = db.cursor()
@@ -263,6 +279,7 @@ class TestBillingDefinition:
                        "VALUES (?,?,?)", (960, 'Def Two SKUs', 'Toronto'))
             db.commit()
         _log(client, 960, 'store_visit', visit_date='2026-07-16')
+        _stock(app_module, 960, PHOENIX); _stock(app_module, 960, DAYAA)
         with app_module.app.app_context():
             db = app_module.get_db(); cur = db.cursor()
             # two DIFFERENT SKUs newly listed after our touch
@@ -279,6 +296,7 @@ class TestBillingDefinition:
                        "VALUES (?,?,?)", (961, 'Def One SKU', 'Toronto'))
             db.commit()
         _log(client, 961, 'store_visit', visit_date='2026-07-16')
+        _stock(app_module, 961, PHOENIX)
         with app_module.app.app_context():
             db = app_module.get_db(); cur = db.cursor()
             app_module._ledger_record(cur, PHOENIX, 961, 'LISTED', 'sod', 'x', '2026-07-18')
