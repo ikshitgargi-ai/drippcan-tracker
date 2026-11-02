@@ -7210,6 +7210,17 @@ def seed_territories():
         # territory_status_history (never silently moved); a store with no
         # postal and no city is placed by its nearest neighbour with
         # coordinates; whatever is left goes to OTHER, never UNASSIGNED.
+        try:
+            cur.execute("CREATE TABLE IF NOT EXISTS territory_status_history ("
+                        + ("id BIGSERIAL PRIMARY KEY" if USE_POSTGRES else "id INTEGER PRIMARY KEY AUTOINCREMENT")
+                        + ", store_number INTEGER, field TEXT, old_value TEXT, new_value TEXT, changed_by TEXT, "
+                        "changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         cur.execute("SELECT id, code FROM territories")
         code_to_id = {row[1]: row[0] for row in cur.fetchall()}
         id_to_code = {v: k for k, v in code_to_id.items()}
@@ -7250,15 +7261,22 @@ def seed_territories():
             assigned_count += 1
             if old_code and old_code not in ('UNASSIGNED', 'OTHER'):
                 moved += 1
+            # the audit row must never poison the placement transaction
             try:
                 if USE_POSTGRES:
+                    cur.execute("SAVEPOINT sp_terr_hist")
                     cur.execute("INSERT INTO territory_status_history (store_number, field, old_value, new_value, changed_by) "
                                 "VALUES (%s,'territory',%s,%s,'auto-assign')", (sn, old_code, code))
+                    cur.execute("RELEASE SAVEPOINT sp_terr_hist")
                 else:
                     cur.execute("INSERT INTO territory_status_history (store_number, field, old_value, new_value, changed_by) "
                                 "VALUES (?,'territory',?,?,'auto-assign')", (sn, old_code, code))
             except Exception:
-                pass
+                if USE_POSTGRES:
+                    try:
+                        cur.execute("ROLLBACK TO SAVEPOINT sp_terr_hist")
+                    except Exception:
+                        pass
         conn.commit()
         cur.close()
         if moved:
