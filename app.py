@@ -2,6 +2,7 @@ from __future__ import annotations  # 3.9-safe lazy annotations (str | None etc.
 
 import os
 import sod_durability
+import sod_asof
 import time
 import io
 import csv
@@ -883,7 +884,7 @@ def _fold_one_store_listing(cur, sku, store_number):
         f"  MAX(CASE WHEN event IN ('LISTED','RECONFIRMED') THEN observed_date END), "
         f"  MAX(CASE WHEN event='DELISTED' THEN observed_date END), "
         f"  SUM(CASE WHEN event IN ('LISTED','RECONFIRMED') THEN 1 ELSE 0 END) "
-        f"FROM listing_ledger WHERE sku={ph} AND store_number={ph}",
+        f"FROM listing_ledger WHERE sku={ph} AND store_number={ph} AND voided_at IS NULL",
         (sku, store_number),
     )
     row = cur.fetchone()
@@ -894,7 +895,7 @@ def _fold_one_store_listing(cur, sku, store_number):
         return  # no ledger rows for this pair — nothing to materialize
     cur.execute(
         f"SELECT DISTINCT source FROM listing_ledger "
-        f"WHERE sku={ph} AND store_number={ph} AND event IN ('LISTED','RECONFIRMED') "
+        f"WHERE sku={ph} AND store_number={ph} AND event IN ('LISTED','RECONFIRMED') AND voided_at IS NULL "
         f"ORDER BY source",
         (sku, store_number),
     )
@@ -1001,12 +1002,12 @@ def _rebuild_store_listings(cur):
         "  MAX(CASE WHEN event IN ('LISTED','RECONFIRMED') THEN observed_date END), "
         "  MAX(CASE WHEN event='DELISTED' THEN observed_date END), "
         "  SUM(CASE WHEN event IN ('LISTED','RECONFIRMED') THEN 1 ELSE 0 END) "
-        "FROM listing_ledger GROUP BY sku, store_number"
+        "FROM listing_ledger WHERE voided_at IS NULL GROUP BY sku, store_number"
     )
     aggs = cur.fetchall()
     cur.execute(
         "SELECT DISTINCT sku, store_number, source FROM listing_ledger "
-        "WHERE event IN ('LISTED','RECONFIRMED') ORDER BY sku, store_number, source"
+        "WHERE event IN ('LISTED','RECONFIRMED') AND voided_at IS NULL ORDER BY sku, store_number, source"
     )
     src_map = {}
     for r in cur.fetchall():
@@ -4606,6 +4607,8 @@ def run_sod_sync(source='daily_a', filename=None, client=None,
     ph = _sod_ph()
     conn = _sod_get_conn()
     try:
+        # as_of_date, void and freshness columns (idempotent, cheap)
+        sod_asof.ensure_columns(conn, USE_POSTGRES)
         cur = conn.cursor()
         # Record the run as 'running' up front for observability
         if USE_POSTGRES:
@@ -4679,7 +4682,7 @@ def run_sod_sync(source='daily_a', filename=None, client=None,
 
 
         # 3) per_sku aggregates for the newest snapshot (already computed during streaming)
-        per_sku = parsed['per_sku_by_date'].get(snapshot_date, {})
+        per_sku = {}   # recomputed from the as-of position once latest_rows exists
         # rows_to_persist holds tracked-SKU rows (Daily A) or all rows (Daily B),
         # and one file can carry more than one day: the annual and option
         # archives always do. The portal keeps only a rolling 7-day window and
@@ -4690,19 +4693,65 @@ def run_sod_sync(source='daily_a', filename=None, client=None,
         rows_by_date = {}
         for r in parsed['rows_to_persist']:
             rows_by_date.setdefault(r['snapshot_date'], []).append(r)
-        latest_rows = rows_by_date.pop(snapshot_date, [])
-        # The older days from the same file. They get their own sod_inventory
-        # rows and their own archive record, but they never feed status-change
-        # detection: that diffs against CURRENT status, so an older day would
-        # invent listing and delisting events, and those events feed billing.
-        extra_rows_by_date = rows_by_date
+        # The daily file is a LATEST-POSITION file: each store's rows carry the
+        # date that store last reported, so one file mixes dates (31 Oct 2026:
+        # half the network a day or two behind). The day's position is the
+        # newest row per (sku, store) across every date in the file, stamped
+        # with the file date and carrying its own as_of_date. Cutting to rows
+        # dated exactly snapshot_date made every late store look DROPPED, and
+        # DROPPED folds into the ledger as DELISTED, which feeds billing.
+        latest_rows, asof_stats = sod_asof.build_latest_position(
+            parsed['rows_to_persist'], snapshot_date)
+        per_sku = sod_asof.per_sku_aggregates(latest_rows)
+        # The older days from the same file, archived under their own true
+        # dates (write-once). They never feed change detection.
+        extra_rows_by_date = {d: rs for d, rs in rows_by_date.items() if d != snapshot_date}
         # Per-day row totals, so each archived day records its own true count
         # instead of the whole file's count.
         total_by_date = parsed.get('total_by_date', {})
+        fresh_share = sod_asof.network_freshness(total_by_date, snapshot_date)
+        print(f"[SOD-{source}] position: {asof_stats['pairs']} store x SKU rows, "
+              f"{asof_stats['stale_pairs']} carried forward from an earlier date "
+              f"(oldest {asof_stats['oldest_as_of']}), network fresh share "
+              f"{fresh_share}")
+        if fresh_share is not None and fresh_share < sod_asof.FRESH_SHARE_ALERT:
+            try:
+                send_alert(
+                    subject=f'SOD: only {fresh_share:.0%} of LCBO stores reported for {snapshot_date}',
+                    body=(f'File {zip_name}: {asof_stats["stale_pairs"]} of our store rows are '
+                          f'carried forward from an earlier date; {len(asof_stats["stale_stores"])} '
+                          f'stores stale. Positions stay complete (as-of dates kept); no delistings '
+                          f'are inferred from the missing rows.'),
+                    level='warning')
+            except Exception as _ae:
+                print(f'[SOD-{source}] freshness alert failed: {_ae}')
         anu_count = sum(1 for r in latest_rows if r['sku'] in SOD_TRACKED_SKUS)
         # Release the parsed buffers we no longer need
         parsed = None
         gc.collect()
+
+        # 3b) Events that absence alone produced (a store that had merely not
+        # reported read as DROPPED, then DELISTED) are voided here, BEFORE the
+        # change detector reads its baseline, so a store that never left is
+        # not announced as a new listing either. Never deletes; the derived
+        # store_listings cache is rebuilt from what survives.
+        void_counts = {}
+        try:
+            if USE_POSTGRES:
+                cur.execute("SAVEPOINT sp_void")
+            void_counts = sod_asof.void_feed_fault_events(cur, USE_POSTGRES, snapshot_date, latest_rows)
+            if any(void_counts.values()):
+                _rebuild_store_listings(cur)
+                print(f"[SOD-{source}] step 3b: voided feed-gap events {void_counts}; store_listings rebuilt")
+            if USE_POSTGRES:
+                cur.execute("RELEASE SAVEPOINT sp_void")
+        except Exception as _ve:
+            if USE_POSTGRES:
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_void")
+                except Exception:
+                    pass
+            print(f"[SOD-{source}] step 3b skipped (non-fatal): {_ve}")
 
         # 4) Pull prior sod_products state to compute SKU-level listing changes.
         # OPTIMIZATION: only fetch the SKUs that appear in this snapshot (was: full
@@ -4770,47 +4819,26 @@ def run_sod_sync(source='daily_a', filename=None, client=None,
         ledger_reconfirms = []
         tracked_in_snapshot = {sku: agg for sku, agg in per_sku.items() if sku in SOD_TRACKED_SKUS}
         for tracked_sku in tracked_in_snapshot:
-            # Find the previous snapshot date for this SKU (the one BEFORE today's)
-            if USE_POSTGRES:
-                cur.execute(
-                    "SELECT MAX(snapshot_date) FROM sod_inventory "
-                    "WHERE sku = %s AND snapshot_date < %s",
-                    (tracked_sku, snapshot_date),
-                )
-                prior_snap = cur.fetchone()[0]
-            else:
-                cur.execute(
-                    "SELECT MAX(snapshot_date) FROM sod_inventory "
-                    "WHERE sku = ? AND snapshot_date < ?",
-                    (tracked_sku, snapshot_date),
-                )
-                prior_snap = cur.fetchone()[0]
-            # Build prior {store -> status}
-            prior_per_store = {}
-            if prior_snap:
-                if USE_POSTGRES:
-                    cur.execute(
-                        "SELECT store_number, status FROM sod_inventory "
-                        "WHERE sku = %s AND snapshot_date = %s",
-                        (tracked_sku, prior_snap),
-                    )
-                else:
-                    cur.execute(
-                        "SELECT store_number, status FROM sod_inventory "
-                        "WHERE sku = ? AND snapshot_date = ?",
-                        (tracked_sku, prior_snap),
-                    )
-                prior_per_store = {r[0]: r[1] for r in cur.fetchall()}
-            # Build current {store -> status} from the rows we just streamed
+            # The baseline is read the same as-of way: the newest row per
+            # store before this file date, within a window. A day the ingest
+            # missed, or a day half the network was late, can then never show
+            # up as stores appearing or disappearing.
+            prior_per_store = sod_asof.prior_position(cur, USE_POSTGRES, tracked_sku, snapshot_date)
+            # Build current {store -> status} from the as-of position, and the
+            # date each store's word actually carries (events are dated by it).
             current_per_store = {
                 r['store_number']: r['status']
+                for r in latest_rows if r['sku'] == tracked_sku
+            }
+            current_asof = {
+                r['store_number']: r.get('as_of_date', snapshot_date)
                 for r in latest_rows if r['sku'] == tracked_sku
             }
             # Every store carrying this SKU right now (status 'L') is a presence
             # proof for the ledger — deduped to one RECONFIRMED per day/source.
             for _store, _st in current_per_store.items():
                 if _st == 'L':
-                    ledger_reconfirms.append((tracked_sku, _store))
+                    ledger_reconfirms.append((tracked_sku, _store, current_asof.get(_store, snapshot_date)))
             # Diff: what's new, what changed, what disappeared
             for store, new_st in current_per_store.items():
                 old_st = prior_per_store.get(store)
@@ -4821,24 +4849,24 @@ def run_sod_sync(source='daily_a', filename=None, client=None,
                     # that never existed).
                     if new_st == 'L':
                         store_change_inserts.append(
-                            (tracked_sku, store, snapshot_date, None, new_st, 'NEW_LISTING'),
+                            (tracked_sku, store, current_asof.get(store, snapshot_date), None, new_st, 'NEW_LISTING'),
                         )
                     else:
                         store_change_inserts.append(
-                            (tracked_sku, store, snapshot_date, None, new_st, 'DELISTED'),
+                            (tracked_sku, store, current_asof.get(store, snapshot_date), None, new_st, 'DELISTED'),
                         )
                 elif old_st != new_st:
                     if new_st == 'L' and old_st in ('D', 'F'):
                         store_change_inserts.append(
-                            (tracked_sku, store, snapshot_date, old_st, new_st, 'RELISTED'),
+                            (tracked_sku, store, current_asof.get(store, snapshot_date), old_st, new_st, 'RELISTED'),
                         )
                     elif new_st in ('D', 'F') and old_st == 'L':
                         store_change_inserts.append(
-                            (tracked_sku, store, snapshot_date, old_st, new_st, 'DELISTED'),
+                            (tracked_sku, store, current_asof.get(store, snapshot_date), old_st, new_st, 'DELISTED'),
                         )
                     else:
                         store_change_inserts.append(
-                            (tracked_sku, store, snapshot_date, old_st, new_st, 'STATUS_FLIP'),
+                            (tracked_sku, store, current_asof.get(store, snapshot_date), old_st, new_st, 'STATUS_FLIP'),
                         )
             for store, old_st in prior_per_store.items():
                 if store not in current_per_store:
@@ -4868,30 +4896,34 @@ def run_sod_sync(source='daily_a', filename=None, client=None,
                     cur,
                     """
                     INSERT INTO sod_inventory
-                        (sku, store_number, snapshot_date, status, on_hand, product_name, source)
+                        (sku, store_number, snapshot_date, status, on_hand, product_name, source, as_of_date)
                     VALUES %s
                     ON CONFLICT (sku, store_number, snapshot_date) DO UPDATE SET
                         status = EXCLUDED.status,
                         on_hand = EXCLUDED.on_hand,
                         product_name = EXCLUDED.product_name,
                         source = EXCLUDED.source,
+                        as_of_date = EXCLUDED.as_of_date,
                         ingested_at = NOW()
                     """,
                     [(r['sku'], r['store_number'], r['snapshot_date'], r['status'],
-                      r['on_hand'], r['product_name'], source) for r in rows],
+                      r['on_hand'], r['product_name'], source,
+                      r.get('as_of_date', r['snapshot_date'])) for r in rows],
                     page_size=1000,
                 )
             else:
                 cur.executemany(
                     """INSERT INTO sod_inventory
-                       (sku, store_number, snapshot_date, status, on_hand, product_name, source)
-                       VALUES (?,?,?,?,?,?,?)
+                       (sku, store_number, snapshot_date, status, on_hand, product_name, source, as_of_date)
+                       VALUES (?,?,?,?,?,?,?,?)
                        ON CONFLICT(sku, store_number, snapshot_date) DO UPDATE SET
                          status=excluded.status, on_hand=excluded.on_hand,
                          product_name=excluded.product_name, source=excluded.source,
+                         as_of_date=excluded.as_of_date,
                          ingested_at=CURRENT_TIMESTAMP""",
                     [(r['sku'], r['store_number'], r['snapshot_date'], r['status'],
-                      r['on_hand'], r['product_name'], source) for r in rows],
+                      r['on_hand'], r['product_name'], source,
+                      r.get('as_of_date', r['snapshot_date'])) for r in rows],
                 )
 
         _upsert_sod_inventory(rows_to_persist)
@@ -5034,13 +5066,15 @@ def run_sod_sync(source='daily_a', filename=None, client=None,
                 ev = _ledger_event_for(c_type)
                 if ev in ('LISTED', 'DELISTED'):
                     if _ledger_record(cur, c_sku, c_store, ev, 'sod', snapshot_date,
-                                      snapshot_date, audit=True):
+                                      _cd, audit=True):
                         ledger_new += 1
-            for (r_sku, r_store) in ledger_reconfirms:
+            for (r_sku, r_store, r_date) in ledger_reconfirms:
                 if (r_sku, r_store) in changed_pairs:
                     continue  # already captured as LISTED/RELISTED this run
+                # Dated by the store's own as-of date: a store LCBO has not
+                # heard from since Thursday is not "reconfirmed" on Saturday.
                 if _ledger_record(cur, r_sku, r_store, 'RECONFIRMED', 'sod', snapshot_date,
-                                  snapshot_date, audit=False):
+                                  r_date, audit=False):
                     ledger_new += 1
             if USE_POSTGRES:
                 cur.execute("RELEASE SAVEPOINT sp_ledger")
@@ -5137,18 +5171,20 @@ def run_sod_sync(source='daily_a', filename=None, client=None,
                 """UPDATE sod_sync_runs SET
                     status='success', file_name=%s, snapshot_date=%s,
                     total_rows=%s, anu_rows=%s, new_listings=%s, new_delistings=%s,
-                    duration_seconds=%s
+                    duration_seconds=%s, fresh_share=%s, stale_stores=%s
                    WHERE id=%s""",
-                (zip_name, snapshot_date, total, anu_count, new_listings, new_delistings, duration, run_id),
+                (zip_name, snapshot_date, total, anu_count, new_listings, new_delistings, duration,
+                 fresh_share, len(asof_stats['stale_stores']), run_id),
             )
         else:
             cur.execute(
                 """UPDATE sod_sync_runs SET
                     status='success', file_name=?, snapshot_date=?,
                     total_rows=?, anu_rows=?, new_listings=?, new_delistings=?,
-                    duration_seconds=?
+                    duration_seconds=?, fresh_share=?, stale_stores=?
                    WHERE id=?""",
-                (zip_name, snapshot_date, total, anu_count, new_listings, new_delistings, duration, run_id),
+                (zip_name, snapshot_date, total, anu_count, new_listings, new_delistings, duration,
+                 fresh_share, len(asof_stats['stale_stores']), run_id),
             )
         conn.commit()
         cur.close()
@@ -5565,7 +5601,8 @@ def api_sod_status():
     if USE_POSTGRES:
         rows_query = (
             "SELECT id, run_at, source, file_name, snapshot_date, status, total_rows, "
-            "anu_rows, new_listings, new_delistings, duration_seconds, error "
+            "anu_rows, new_listings, new_delistings, duration_seconds, error, "
+            "fresh_share, stale_stores "
             "FROM sod_sync_runs "
             "WHERE NOT (status='running' AND run_at < NOW() - INTERVAL '6 hours') "
             "ORDER BY run_at DESC LIMIT 20"
@@ -5573,7 +5610,8 @@ def api_sod_status():
     else:
         rows_query = (
             "SELECT id, run_at, source, file_name, snapshot_date, status, total_rows, "
-            "anu_rows, new_listings, new_delistings, duration_seconds, error "
+            "anu_rows, new_listings, new_delistings, duration_seconds, error, "
+            "fresh_share, stale_stores "
             "FROM sod_sync_runs "
             "WHERE NOT (status='running' AND datetime(run_at) < datetime('now','-6 hours')) "
             "ORDER BY run_at DESC LIMIT 20"
@@ -6455,6 +6493,27 @@ def start_sod_scheduler():
               f'(next: {next_run})')
 
         # --- Startup catch-up: if no sync in > 6h OR snapshot > 1 day old, fire immediately ---
+        def _asof_position_pending():
+            """True when the newest day in sod_inventory was written by the old
+            same-date-only logic (no as_of_date on any of its rows), so one
+            re-ingest of the current file rebuilds the complete position."""
+            try:
+                c = _sod_get_conn()
+                try:
+                    k = c.cursor()
+                    k.execute("SELECT MAX(snapshot_date) FROM sod_inventory")
+                    mx = k.fetchone()[0]
+                    if not mx:
+                        return False
+                    k.execute("SELECT COUNT(*) FROM sod_inventory WHERE snapshot_date=%s AND as_of_date IS NOT NULL"
+                              if USE_POSTGRES else
+                              "SELECT COUNT(*) FROM sod_inventory WHERE snapshot_date=? AND as_of_date IS NOT NULL", (mx,))
+                    return int(k.fetchone()[0] or 0) == 0
+                finally:
+                    c.close()
+            except Exception:
+                return False
+
         def _catchup_if_stale():
             try:
                 import time as _t
@@ -6466,6 +6525,7 @@ def start_sod_scheduler():
                     or run_age > 6
                     or data_age is None
                     or data_age > 1
+                    or _asof_position_pending()
                 )
                 if should_catchup:
                     print(
@@ -7596,6 +7656,183 @@ def api_crm_gap_by_territory():
                 'latest_snapshot': str(latest_d) if latest_d else None,
             })
     return jsonify(results)
+
+
+# ------- Gap report by territory (as-of aware, lcbo.com confirmed) -------
+_GAP_ACTIONS = {
+    'gap_untouched': 'Never visited: pitch the listing',
+    'gap_touched': 'Visited, no listing yet: follow up with the manager',
+    'listed_no_stock': 'Listed but zero on hand: ask the store to reorder',
+    'delisting': 'Being delisted, stock still on the shelf: protect or move it',
+    'live_only': 'lcbo.com shows stock but LCBO data has no listing row: check the shelf',
+    'carrying': 'Carrying',
+}
+
+
+def _gap_report_payload(db, sku=None, territory_id=None, include='actionable'):
+    """One report a rep or manager can act on, per SKU, grouped by territory.
+
+    Carrying is read from the as-of position (every store's newest word, with
+    its date) and confirmed against the latest lcbo.com check, so a store
+    that was merely late reporting is never shown as a gap. Rep touches come
+    from anu_accounts and the visit log. Warehouse locations are reported
+    separately as warehouse stock, never as store gaps.
+    """
+    from datetime import date as _date
+    skus = [sku.zfill(7)] if sku else list(SOD_TRACKED_SKUS.keys())
+    try:
+        _ensure_anu_accounts(db)
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    # stores with territory (retail only; warehouses handled apart)
+    sw, sp = ['1=1'], []
+    if territory_id:
+        sw.append('s.territory_id = ?'); sp.append(territory_id)
+    stores = []
+    for r in db_fetchall(
+            "SELECT s.store_number, s.account, s.address, s.city, s.postal, s.rep, s.priority, "
+            "s.territory_id, COALESCE(t.code,'') AS tcode, COALESCE(t.name,'') AS tname, "
+            "COALESCE(t.color,'#888') AS tcolor FROM stores s LEFT JOIN territories t ON t.id = s.territory_id "
+            f"WHERE {' AND '.join(sw)} ORDER BY COALESCE(t.name,'zzz'), s.city, s.store_number", sp):
+        d = row_to_dict(r)
+        if int(d['store_number']) in sod_asof.WAREHOUSE_LOCATIONS:
+            continue
+        stores.append(d)
+    # rep touches
+    claimed = {}
+    try:
+        for r in db_fetchall("SELECT store_number, CAST(claimed_at AS TEXT) AS c, first_touch_type FROM anu_accounts"):
+            d = row_to_dict(r); claimed[int(d['store_number'])] = (str(d['c'] or '')[:10], d.get('first_touch_type') or '')
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    last_visit = {}
+    try:
+        for r in db_fetchall(
+                "SELECT s.store_number, CAST(COALESCE(a.visit_date, a.created_at) AS TEXT) AS d, a.activity_type, "
+                "COALESCE(NULLIF(a.rep,''), rp.name, '') AS rep FROM activities a JOIN stores s ON s.id = a.store_id "
+                "LEFT JOIN reps rp ON rp.id = a.rep_id WHERE a.deleted_at IS NULL ORDER BY COALESCE(a.visit_date, a.created_at)"):
+            d = row_to_dict(r); last_visit[int(d['store_number'])] = (str(d['d'] or '')[:10], d.get('activity_type') or '', d.get('rep') or '')
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    # data quality from the last successful daily run
+    dq = {}
+    try:
+        r = db_fetchone("SELECT CAST(snapshot_date AS TEXT) AS d, fresh_share, stale_stores, CAST(run_at AS TEXT) AS run_at "
+                        "FROM sod_sync_runs WHERE source='daily_a' AND status='success' ORDER BY id DESC LIMIT 1")
+        if r:
+            d = row_to_dict(r)
+            dq = {'snapshot_date': d.get('d'), 'network_fresh_share': d.get('fresh_share'),
+                  'stale_stores': d.get('stale_stores'), 'ingested_at': d.get('run_at')}
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    today = _toronto_today() if '_toronto_today' in globals() else _date.today()
+    out = {'generated_for': str(today), 'data_quality': dq, 'territory_id': territory_id,
+           'include': include, 'skus': []}
+    for tsku in skus:
+        brand, pname = SOD_TRACKED_SKUS.get(tsku, ('', tsku))
+        snap = (row_to_dict(db_fetchone("SELECT MAX(snapshot_date) AS d FROM sod_inventory WHERE sku=?", (tsku,)) or {}) or {}).get('d')
+        snap = str(snap)[:10] if snap else None
+        position = {}
+        if snap:
+            for r in db_fetchall("SELECT store_number, status, on_hand, CAST(as_of_date AS TEXT) AS a FROM sod_inventory "
+                                 "WHERE sku=? AND snapshot_date=?", (tsku, snap)):
+                d = row_to_dict(r)
+                position[int(d['store_number'])] = (d.get('status') or '', int(d.get('on_hand') or 0), (d.get('a') or snap)[:10])
+        live, live_at = {}, None
+        try:
+            b = db_fetchone("SELECT batch_id, CAST(MAX(checked_at) AS TEXT) AS c FROM lcbo_live_snapshots WHERE sku=? "
+                            "GROUP BY batch_id ORDER BY MAX(checked_at) DESC LIMIT 1", (tsku,))
+            if b:
+                bd = row_to_dict(b); live_at = bd.get('c')
+                for r in db_fetchall("SELECT store_number, qty FROM lcbo_live_snapshots WHERE sku=? AND batch_id=?", (tsku, bd['batch_id'])):
+                    d = row_to_dict(r); live[int(d['store_number'])] = int(d.get('qty') or 0)
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        terr, rows, carrying_count, carrying_units = {}, [], 0, 0
+        for st in stores:
+            sn = int(st['store_number'])
+            tkey = st.get('territory_id') or 0
+            t = terr.setdefault(tkey, {'territory_id': st.get('territory_id'), 'code': st.get('tcode') or 'UNASSIGNED',
+                                       'name': st.get('tname') or 'Unassigned', 'color': st.get('tcolor') or '#888',
+                                       'stores': 0, 'carrying': 0, 'carrying_units': 0, 'listed_no_stock': 0,
+                                       'delisting': 0, 'gap_touched': 0, 'gap_untouched': 0, 'live_only': 0})
+            t['stores'] += 1
+            pos = position.get(sn)
+            lq = live.get(sn)
+            touched = sn in claimed or sn in last_visit
+            if pos is None:
+                bucket = 'live_only' if (lq or 0) > 0 else ('gap_touched' if touched else 'gap_untouched')
+                status, on_hand, as_of = '', 0, None
+            else:
+                status, on_hand, as_of = pos
+                if status == 'L' and (on_hand > 0 or (lq or 0) > 0):
+                    bucket = 'carrying'
+                elif status == 'L':
+                    bucket = 'listed_no_stock'
+                else:
+                    bucket = 'delisting'
+            t[bucket] += 1
+            if bucket == 'carrying':
+                carrying_count += 1; carrying_units += on_hand; t['carrying_units'] += on_hand
+                if include != 'all':
+                    continue
+            stale_days = None
+            if as_of and snap:
+                try:
+                    stale_days = (_date.fromisoformat(snap) - _date.fromisoformat(as_of)).days
+                except Exception:
+                    stale_days = None
+            cl = claimed.get(sn); lv = last_visit.get(sn)
+            rows.append({
+                'store_number': sn, 'account': st.get('account'), 'address': st.get('address'), 'city': st.get('city'),
+                'postal': st.get('postal'), 'rep': st.get('rep') or '', 'priority': st.get('priority') or '',
+                'territory_id': st.get('territory_id'), 'territory_code': t['code'], 'territory_name': t['name'],
+                'territory_color': t['color'], 'bucket': bucket, 'action': _GAP_ACTIONS.get(bucket, ''),
+                'sod_status': status, 'on_hand': on_hand, 'as_of_date': as_of, 'stale_days': stale_days,
+                'live_qty': lq, 'touched': touched, 'claimed_at': cl[0] if cl else None,
+                'first_touch_type': cl[1] if cl else None, 'last_visit_date': lv[0] if lv else None,
+                'last_visit_type': lv[1] if lv else None, 'last_visit_rep': lv[2] if lv else None,
+            })
+        for t in terr.values():
+            t['coverage_pct'] = round(100.0 * t['carrying'] / t['stores'], 1) if t['stores'] else 0.0
+        warehouse = []
+        for loc, label in sorted(sod_asof.WAREHOUSE_LOCATIONS.items()):
+            pos = position.get(loc)
+            if pos:
+                warehouse.append({'location': loc, 'label': label, 'status': pos[0], 'on_hand': pos[1], 'as_of_date': pos[2]})
+        order = {'gap_untouched': 0, 'gap_touched': 1, 'listed_no_stock': 2, 'delisting': 3, 'live_only': 4, 'carrying': 5}
+        rows.sort(key=lambda r: (r['territory_name'], order.get(r['bucket'], 9), r['city'] or '', r['store_number']))
+        out['skus'].append({
+            'sku': tsku, 'brand': brand, 'product_name': pname, 'snapshot_date': snap, 'live_checked_at': live_at,
+            'carrying_stores': carrying_count, 'carrying_units': carrying_units,
+            'territories': sorted(terr.values(), key=lambda t: t['name']),
+            'rows': rows, 'warehouse': warehouse, 'warehouse_units': sum(w['on_hand'] for w in warehouse),
+        })
+    return out
+
+
+@app.route('/api/crm/gap-report', methods=['GET'])
+def api_crm_gap_report():
+    """Gap report by territory. Query: sku, territory_id, include=actionable|all."""
+    sku = request.args.get('sku', '').strip() or None
+    territory_id = request.args.get('territory_id', type=int)
+    include = 'all' if request.args.get('include', '').strip() == 'all' else 'actionable'
+    return jsonify(_gap_report_payload(get_db(), sku=sku, territory_id=territory_id, include=include))
 
 
 # ------- Opportunity finder: slow-mover replacement candidates -------
@@ -10302,8 +10539,8 @@ def api_listings_added():
     rows = db_fetchall(
         "SELECT id, sku, store_number, source, source_detail, "
         "CAST(observed_date AS TEXT) AS observed_date, "
-        "CAST(recorded_at AS TEXT) AS recorded_at, note "
-        "FROM listing_ledger WHERE event='LISTED' AND observed_date >= ? "
+        "CAST(recorded_at AS TEXT) AS recorded_at, note, CAST(voided_at AS TEXT) AS voided_at, void_reason "
+        "FROM listing_ledger WHERE event='LISTED' AND voided_at IS NULL AND observed_date >= ? "
         f"{sku_clause}"
         "ORDER BY observed_date DESC, id DESC", params)
 
@@ -10317,7 +10554,7 @@ def api_listings_added():
     first_listed = {}
     for fsn, fsku, fdate in db_fetchall(
             "SELECT store_number, sku, MIN(CAST(observed_date AS TEXT)) "
-            "FROM listing_ledger WHERE event='LISTED' "
+            "FROM listing_ledger WHERE event='LISTED' AND voided_at IS NULL "
             "GROUP BY store_number, sku"):
         first_listed[(int(fsn), fsku)] = str(fdate)
 
@@ -10377,7 +10614,7 @@ def api_listings_store(store_number):
     for r in db_fetchall(
         "SELECT sku, event, source, source_detail, "
         "CAST(observed_date AS TEXT) AS observed_date, "
-        "CAST(recorded_at AS TEXT) AS recorded_at, note "
+        "CAST(recorded_at AS TEXT) AS recorded_at, note, CAST(voided_at AS TEXT) AS voided_at, void_reason "
         "FROM listing_ledger WHERE store_number = ? "
         "ORDER BY observed_date DESC, id DESC", (sn,)):
         d = row_to_dict(r)
@@ -10443,7 +10680,7 @@ def api_listings_ledger():
     rows = db_fetchall(
         "SELECT id, sku, store_number, event, source, source_detail, "
         "CAST(observed_date AS TEXT) AS observed_date, "
-        "CAST(recorded_at AS TEXT) AS recorded_at, note "
+        "CAST(recorded_at AS TEXT) AS recorded_at, note, CAST(voided_at AS TEXT) AS voided_at, void_reason "
         "FROM listing_ledger WHERE observed_date >= ? "
         f"{sku_clause}"
         "ORDER BY observed_date DESC, id DESC LIMIT 5000", params)
@@ -13962,7 +14199,7 @@ def api_admin_integrity():
             "SELECT DISTINCT ll.sku, ll.store_number FROM listing_ledger ll "
             "LEFT JOIN store_listings sl "
             "  ON sl.sku = ll.sku AND sl.store_number = ll.store_number "
-            "WHERE sl.id IS NULL ORDER BY ll.sku, ll.store_number LIMIT 200"):
+            "WHERE sl.id IS NULL AND ll.voided_at IS NULL ORDER BY ll.sku, ll.store_number LIMIT 200"):
             d = row_to_dict(r)
             out['ledger_orphans'].append(
                 {'sku': d['sku'], 'store_number': int(d['store_number'])})
@@ -24837,7 +25074,7 @@ def _post_launch_listed_keys(db, launch):
     seq = {}
     for sn, sku, ev, od in db_fetchall(
             "SELECT store_number, sku, event, CAST(observed_date AS TEXT) "
-            "FROM listing_ledger WHERE event IN ('LISTED','DELISTED') "
+            "FROM listing_ledger WHERE event IN ('LISTED','DELISTED') AND voided_at IS NULL "
             "ORDER BY observed_date"):
         if sn is None or not sku:
             continue
@@ -24941,7 +25178,7 @@ def _dripp_billing_reconcile(db):
     earliest = {}
     for sn, sku, odate in db_fetchall(
             "SELECT store_number, sku, MIN(CAST(observed_date AS TEXT)) "
-            "FROM listing_ledger WHERE event='LISTED' "
+            "FROM listing_ledger WHERE event='LISTED' AND voided_at IS NULL "
             "GROUP BY store_number, sku"):
         if sn is None or not sku:
             continue
@@ -25079,7 +25316,7 @@ def _dripp_billing_reconcile(db):
                 "SELECT event, CAST(observed_date AS TEXT) FROM listing_ledger "
                 "WHERE store_number=" + ('%s' if USE_POSTGRES else '?') +
                 " AND sku=" + ('%s' if USE_POSTGRES else '?') +
-                " ORDER BY observed_date", (sn, sku))
+                " AND voided_at IS NULL ORDER BY observed_date", (sn, sku))
             seq = [(str(e[0]), str(e[1])[:10]) for e in ev]
             had_delist = any(e == 'DELISTED' for e, _ in seq)
             relist_after = any(e == 'LISTED' and dt > launch for e, dt in seq)
@@ -25212,7 +25449,7 @@ def api_anu_accounts():
 
     ledger = db_fetchall(
         "SELECT store_number, sku, source, observed_date FROM listing_ledger "
-        "WHERE event = 'LISTED' ORDER BY observed_date")
+        "WHERE event = 'LISTED' AND voided_at IS NULL ORDER BY observed_date")
     # Collapse to ONE listing per store×SKU (a listing is a store×SKU placement,
     # and Kevin pays per listing — NOT per ledger row). The earliest observed
     # date across sources is the best proxy for when the listing was created;
@@ -25456,6 +25693,12 @@ def start_lcbo_scheduler():
 # ======== INIT ========
 
 init_db()
+try:
+    _c0 = _sod_get_conn()
+    sod_asof.ensure_columns(_c0, USE_POSTGRES)
+    _c0.close()
+except Exception as _e0:
+    print(f'[asof] column check at boot failed (app continues): {_e0}')
 seed_data()
 seed_territories()
 refresh_sod_product_categories()
