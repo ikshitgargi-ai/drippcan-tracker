@@ -244,10 +244,10 @@ class TestGapReport:
         assert rep['snapshot_date'] is not None
         assert isinstance(rep['territories'], list) and rep['territories']
         t0 = rep['territories'][0]
-        for k in ('name', 'stores', 'carrying', 'listed_no_stock', 'delisting', 'gap_touched', 'gap_untouched', 'coverage_pct'):
+        for k in ('name', 'stores', 'carrying', 'sell_through', 'listed_no_stock', 'relist_target', 'gap_touched', 'gap_untouched', 'coverage_pct'):
             assert k in t0, k
         buckets = {row['bucket'] for row in rep['rows']}
-        assert buckets <= {'gap_untouched', 'gap_touched', 'listed_no_stock', 'delisting', 'live_only'}
+        assert buckets <= {'gap_untouched', 'gap_touched', 'listed_no_stock', 'relist_target', 'live_only'}
         # every actionable row carries an action sentence and the as-of fields
         assert all(row['action'] for row in rep['rows'])
         assert all('as_of_date' in row and 'stale_days' in row and 'live_qty' in row for row in rep['rows'])

@@ -7663,9 +7663,10 @@ _GAP_ACTIONS = {
     'gap_untouched': 'Never visited: pitch the listing',
     'gap_touched': 'Visited, no listing yet: follow up with the manager',
     'listed_no_stock': 'Listed but zero on hand: ask the store to reorder',
-    'delisting': 'Being delisted, stock still on the shelf: protect or move it',
+    'relist_target': 'Delisted and sold out: pitch a relist',
     'live_only': 'lcbo.com shows stock but LCBO data has no listing row: check the shelf',
     'carrying': 'Carrying',
+    'carrying_sell_through': 'Carrying on sell-through (LCBO will not reorder): protect the facing, move the stock',
 }
 
 
@@ -7769,26 +7770,34 @@ def _gap_report_payload(db, sku=None, territory_id=None, include='actionable'):
             tkey = st.get('territory_id') or 0
             t = terr.setdefault(tkey, {'territory_id': st.get('territory_id'), 'code': st.get('tcode') or 'UNASSIGNED',
                                        'name': st.get('tname') or 'Unassigned', 'color': st.get('tcolor') or '#888',
-                                       'stores': 0, 'carrying': 0, 'carrying_units': 0, 'listed_no_stock': 0,
-                                       'delisting': 0, 'gap_touched': 0, 'gap_untouched': 0, 'live_only': 0})
+                                       'stores': 0, 'carrying': 0, 'carrying_units': 0, 'sell_through': 0,
+                                       'listed_no_stock': 0, 'relist_target': 0, 'gap_touched': 0,
+                                       'gap_untouched': 0, 'live_only': 0})
             t['stores'] += 1
             pos = position.get(sn)
             lq = live.get(sn)
             touched = sn in claimed or sn in last_visit
+            sell_through = False
             if pos is None:
                 bucket = 'live_only' if (lq or 0) > 0 else ('gap_touched' if touched else 'gap_untouched')
                 status, on_hand, as_of = '', 0, None
             else:
                 status, on_hand, as_of = pos
-                if status == 'L' and (on_hand > 0 or (lq or 0) > 0):
+                in_stock = on_hand > 0 or (lq or 0) > 0
+                if in_stock:
+                    # stock on the shelf is carrying whatever the status code; a
+                    # one-time buy spends its whole life as D (sell-through)
                     bucket = 'carrying'
+                    sell_through = status in ('D', 'F')
                 elif status == 'L':
                     bucket = 'listed_no_stock'
                 else:
-                    bucket = 'delisting'
+                    bucket = 'relist_target'       # delisted and sold out
             t[bucket] += 1
             if bucket == 'carrying':
                 carrying_count += 1; carrying_units += on_hand; t['carrying_units'] += on_hand
+                if sell_through:
+                    t['sell_through'] += 1
                 if include != 'all':
                     continue
             stale_days = None
@@ -7802,7 +7811,8 @@ def _gap_report_payload(db, sku=None, territory_id=None, include='actionable'):
                 'store_number': sn, 'account': st.get('account'), 'address': st.get('address'), 'city': st.get('city'),
                 'postal': st.get('postal'), 'rep': st.get('rep') or '', 'priority': st.get('priority') or '',
                 'territory_id': st.get('territory_id'), 'territory_code': t['code'], 'territory_name': t['name'],
-                'territory_color': t['color'], 'bucket': bucket, 'action': _GAP_ACTIONS.get(bucket, ''),
+                'territory_color': t['color'], 'bucket': bucket, 'sell_through': sell_through,
+                'action': _GAP_ACTIONS['carrying_sell_through'] if (bucket == 'carrying' and sell_through) else _GAP_ACTIONS.get(bucket, ''),
                 'sod_status': status, 'on_hand': on_hand, 'as_of_date': as_of, 'stale_days': stale_days,
                 'live_qty': lq, 'touched': touched, 'claimed_at': cl[0] if cl else None,
                 'first_touch_type': cl[1] if cl else None, 'last_visit_date': lv[0] if lv else None,
@@ -7815,7 +7825,7 @@ def _gap_report_payload(db, sku=None, territory_id=None, include='actionable'):
             pos = position.get(loc)
             if pos:
                 warehouse.append({'location': loc, 'label': label, 'status': pos[0], 'on_hand': pos[1], 'as_of_date': pos[2]})
-        order = {'gap_untouched': 0, 'gap_touched': 1, 'listed_no_stock': 2, 'delisting': 3, 'live_only': 4, 'carrying': 5}
+        order = {'gap_untouched': 0, 'gap_touched': 1, 'listed_no_stock': 2, 'relist_target': 3, 'live_only': 4, 'carrying': 5}
         rows.sort(key=lambda r: (r['territory_name'], order.get(r['bucket'], 9), r['city'] or '', r['store_number']))
         out['skus'].append({
             'sku': tsku, 'brand': brand, 'product_name': pname, 'snapshot_date': snap, 'live_checked_at': live_at,
@@ -10584,6 +10594,7 @@ def api_listings_added():
             'observed_date': d['observed_date'],
             'recorded_at': d['recorded_at'],
             'note': d['note'],
+            'voided_at': d.get('voided_at'), 'void_reason': d.get('void_reason'),
             'attribution': attribution,
         })
         by_source[d['source']] = by_source.get(d['source'], 0) + 1
@@ -10628,6 +10639,7 @@ def api_listings_store(store_number):
             'observed_date': d['observed_date'],
             'recorded_at': d['recorded_at'],
             'note': d['note'],
+            'voided_at': d.get('voided_at'), 'void_reason': d.get('void_reason'),
         })
     current = []
     today = _toronto_today()
@@ -10699,6 +10711,7 @@ def api_listings_ledger():
             'observed_date': d['observed_date'],
             'recorded_at': d['recorded_at'],
             'note': d['note'],
+            'voided_at': d.get('voided_at'), 'void_reason': d.get('void_reason'),
         })
         by_event[d['event']] = by_event.get(d['event'], 0) + 1
     return jsonify({'days': days, 'since': since, 'count': len(out),
