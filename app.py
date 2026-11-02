@@ -3,6 +3,7 @@ from __future__ import annotations  # 3.9-safe lazy annotations (str | None etc.
 import os
 import sod_durability
 import sod_asof
+import rep_accounts
 import time
 import io
 import csv
@@ -2423,14 +2424,189 @@ def api_store_snapshot(store_id):
 
 @app.route('/api/reps')
 def api_reps():
-    # Roster lists show ONLY the official roster. The stale legacy row
-    # 'Ikshit Sharma' stays in the DB (nothing is ever deleted) but is
-    # filtered out of every roster/picker payload.
-    ph_list = ','.join(['?'] * len(REP_ROSTER_DEFAULT))
-    rows = db_fetchall(
-        f"SELECT * FROM reps WHERE TRIM(name) IN ({ph_list}) ORDER BY name",
-        list(REP_ROSTER_DEFAULT))
-    return jsonify([dict(r) for r in rows])
+    """Active reps, from the database. A retired rep stays in the table with
+    every visit they logged, but leaves every picker the moment a manager
+    retires them; a new rep appears the moment they are added."""
+    conn, cur = _rep_cursor_conn()
+    try:
+        return jsonify(rep_accounts.list_reps(cur, USE_POSTGRES))
+    finally:
+        conn.close()
+
+
+# ───────────────────────────── REP ACCOUNTS ──────────────────────────────
+# The roster lives in the database. Managers add and retire reps from the
+# app; reps sign in with a PIN once one is set. See rep_accounts.py.
+
+def _rep_cursor_conn():
+    """A raw connection + cursor for rep_accounts helpers (they take cursors)."""
+    conn = _sod_get_conn()
+    return conn, conn.cursor()
+
+
+def _refresh_rep_roster_from_db():
+    """Make every roster constant follow the database, in place, so the
+    pickers, store matching and performance pages all see a rep the moment a
+    manager adds one, and stop seeing a retired one."""
+    try:
+        conn, cur = _rep_cursor_conn()
+        try:
+            names = rep_accounts.active_names(cur, USE_POSTGRES)
+        finally:
+            conn.close()
+        if not names:
+            return
+        REP_ROSTER_DEFAULT[:] = names
+        _REP_MATCH_NAMES[:] = names
+        g = globals()
+        if 'OFFICIAL_REPS' in g and isinstance(g['OFFICIAL_REPS'], list):
+            g['OFFICIAL_REPS'][:] = names
+        if '_OFFICIAL_STORE_REPS' in g:
+            g['_OFFICIAL_STORE_REPS'] = tuple(n.lower() for n in names)
+    except Exception as _e:
+        print(f'[reps] roster refresh skipped: {_e}')
+
+
+def _session_rep_from_request():
+    token = (request.headers.get('X-Rep-Token') or '').strip()
+    if not token:
+        return None
+    try:
+        conn, cur = _rep_cursor_conn()
+        try:
+            rep = rep_accounts.session_rep(cur, USE_POSTGRES, token)
+            conn.commit()
+            return rep
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def _manager_ok():
+    """Admin token (only when one is configured; no localhost convenience),
+    the owner passcode, or a signed-in manager or owner."""
+    expected_admin = (os.environ.get('ADMIN_TOKEN') or '').strip()
+    got_admin = (request.headers.get('X-Admin-Token') or '').strip()
+    if expected_admin and got_admin and len(got_admin) == len(expected_admin) and _hmac.compare_digest(got_admin, expected_admin):
+        return True
+    expected = (os.environ.get('OWNER_PASSCODE') or '').strip()
+    given = (request.headers.get('X-Owner-Passcode') or '').strip()
+    if expected and given and len(given) == len(expected) and _hmac.compare_digest(given, expected):
+        return True
+    rep = _session_rep_from_request()
+    return bool(rep and rep.get('role') in ('manager', 'owner'))
+
+
+def require_manager(fn):
+    from functools import wraps
+
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        if not _manager_ok():
+            return jsonify({'error': 'forbidden', 'detail': 'Sign in as a manager or owner, or provide the owner passcode.'}), 403
+        return fn(*args, **kwargs)
+    return wrapped
+
+
+@app.route('/api/reps/all', methods=['GET'])
+@require_manager
+def api_reps_all():
+    conn, cur = _rep_cursor_conn()
+    try:
+        return jsonify(rep_accounts.list_reps(cur, USE_POSTGRES, include_retired=True))
+    finally:
+        conn.close()
+
+
+@app.route('/api/reps', methods=['POST'])
+@require_manager
+def api_reps_create():
+    body = request.get_json(silent=True) or {}
+    conn, cur = _rep_cursor_conn()
+    try:
+        rep = rep_accounts.create_or_reactivate(
+            cur, USE_POSTGRES, body.get('name'), role=body.get('role') or 'rep',
+            email=body.get('email') or '', phone=body.get('phone') or '', pin=body.get('pin'),
+            notes=body.get('notes') or '')
+        conn.commit()
+    except ValueError as e:
+        conn.rollback(); conn.close()
+        return jsonify({'error': str(e)}), 400
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    _refresh_rep_roster_from_db()
+    try:
+        _log_event('rep_added', 'rep', rep['id'], rep['name'], {'role': rep['role']})
+    except Exception:
+        pass
+    return jsonify(rep), 201
+
+
+@app.route('/api/reps/<int:rep_id>', methods=['PATCH'])
+@require_manager
+def api_reps_update(rep_id):
+    body = request.get_json(silent=True) or {}
+    allowed = {k: body[k] for k in ('active', 'role', 'email', 'phone', 'notes', 'pin') if k in body}
+    conn, cur = _rep_cursor_conn()
+    try:
+        rep = rep_accounts.update_rep(cur, USE_POSTGRES, rep_id, allowed)
+        conn.commit()
+    except ValueError as e:
+        conn.rollback(); conn.close()
+        return jsonify({'error': str(e)}), 400
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    _refresh_rep_roster_from_db()
+    try:
+        _log_event('rep_retired' if allowed.get('active') is False else 'rep_updated', 'rep', rep['id'], rep['name'],
+                   {k: ('***' if k == 'pin' else v) for k, v in allowed.items()})
+    except Exception:
+        pass
+    return jsonify(rep)
+
+
+@app.route('/api/auth/login', methods=['POST'])
+def api_auth_login():
+    body = request.get_json(silent=True) or {}
+    conn, cur = _rep_cursor_conn()
+    try:
+        ok, payload = rep_accounts.login(cur, USE_POSTGRES, body.get('name'), body.get('pin'),
+                                         request.headers.get('User-Agent', ''))
+        conn.commit()
+    finally:
+        conn.close()
+    if not ok:
+        return jsonify(payload), (401 if payload.get('pin_required') else 404)
+    return jsonify(payload)
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+def api_auth_logout():
+    token = (request.headers.get('X-Rep-Token') or '').strip()
+    if token:
+        conn, cur = _rep_cursor_conn()
+        try:
+            rep_accounts.logout(cur, USE_POSTGRES, token)
+            conn.commit()
+        finally:
+            conn.close()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/auth/me', methods=['GET'])
+def api_auth_me():
+    rep = _session_rep_from_request()
+    if not rep:
+        return jsonify({'error': 'not signed in'}), 401
+    return jsonify(rep)
+
 
 
 @app.route('/api/activities', methods=['POST'])
@@ -2444,6 +2620,25 @@ def api_activity_create():
     venue_type = data.get('venue_type', '')
     notes = data.get('notes', '')
     follow_up_date = data.get('follow_up_date', '')
+
+    # Who is logging: a signed-in session wins over the body; a rep who has a
+    # PIN on file cannot be logged for by name alone.
+    _session = _session_rep_from_request()
+    if _session:
+        rep_id = _session['id']
+    elif rep_id:
+        try:
+            _c, _k = _rep_cursor_conn()
+            try:
+                _target = rep_accounts.get_rep(_k, USE_POSTGRES, rep_id=int(rep_id))
+            finally:
+                _c.close()
+            if _target and _target.get('pin_hash'):
+                return jsonify({'error': 'sign in with your PIN to log as this rep', 'pin_required': True}), 401
+            if _target and not _target.get('active'):
+                return jsonify({'error': 'this rep is retired; ask a manager to reactivate them'}), 403
+        except Exception:
+            pass
 
     if not all([store_id, rep_id, activity_type]):
         return jsonify({'error': 'Missing required fields'}), 400
@@ -8661,6 +8856,10 @@ _EXPORT_TABLES = [
     ('anu_accounts',               'store_number'),
     # Per-visit per-SKU outcomes — real field data, was missing from backup.
     ('activity_sku_outcomes',      'id'),
+    ('rep_sessions',               'token'),     # rep sign-ins (PIN sessions) (2026-11-02)
+    ('rep_account_meta',           'key'),       # roster migration marker (2026-11-02)
+    ('visit_photos',               'id'),        # rep photos per visit, real field data (2026-11-02)
+    ('weekly_reports',             'id'),        # generated weekly reports (2026-11-02)
     # Optional (large)
     ('sod_inventory',              None),  # 1M+ rows, only included with ?include=all
     ('inventory_history',          None),
@@ -22250,6 +22449,7 @@ def api_crm_reps_with_stores():
     rows are untouched."""
     db = get_db()
     ph = '%s' if USE_POSTGRES else '?'
+    _refresh_rep_roster_from_db()
     roster_lower = [r.lower().strip() for r in REP_ROSTER_DEFAULT]
     ph_list = ','.join([ph] * len(roster_lower))
     q = (
@@ -25764,6 +25964,16 @@ try:
     _cur.close()
     _conn.close()
     print(f"[startup] Ensured {len(REP_ROSTER_DEFAULT)} official reps in DB: {REP_ROSTER_DEFAULT}")
+    try:
+        _ra_conn = _sod_get_conn()
+        rep_accounts.ensure_schema(_ra_conn, USE_POSTGRES)
+        if rep_accounts.normalize_roster(_ra_conn, USE_POSTGRES, REP_ROSTER_DEFAULT, owner_name='Ikshit'):
+            print('[startup] Rep accounts: roster moved into the database (one-time)')
+        _ra_conn.close()
+        _refresh_rep_roster_from_db()
+        print(f"[startup] Rep accounts ready; active roster from the database: {REP_ROSTER_DEFAULT}")
+    except Exception as _ra_err:
+        print(f'[startup] rep accounts setup failed (app continues on the seed roster): {_ra_err}')
 
     # Converge stores.rep onto the roster short names the dropdown sends.
     # The seed only normalises rows it INSERTS, and existing rows still carry
