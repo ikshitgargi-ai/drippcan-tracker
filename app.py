@@ -7082,86 +7082,49 @@ def api_test_alert():
 # Ontario postal codes start with K/L/M/N/P. Grouping below follows common LCBO/wholesale
 # territorial splits. Editable via the /api/crm/territories endpoint.
 ONTARIO_TERRITORIES = [
-    {
-        'code': 'TOR_CORE',
-        'name': 'Toronto Core',
-        'region': 'GTA',
-        'color': '#b22222',
-        'fsa_prefixes': 'M4,M5,M6',
-        'city_prefixes': 'toronto',
-    },
-    {
-        'code': 'TOR_EAST',
-        'name': 'Toronto East + Scarborough',
-        'region': 'GTA',
-        'color': '#d4a574',
-        'fsa_prefixes': 'M1,M3,M4L,M4M',
-        'city_prefixes': 'scarborough,east york,north york',
-    },
-    {
-        'code': 'TOR_WEST',
-        'name': 'Toronto West + Etobicoke',
-        'region': 'GTA',
-        'color': '#e07a5f',
-        'fsa_prefixes': 'M8,M9',
-        'city_prefixes': 'etobicoke,york',
-    },
-    {
-        'code': 'GTA_WEST',
-        'name': 'Mississauga / Oakville / Brampton',
-        'region': 'GTA',
-        'color': '#f2cc8f',
-        'fsa_prefixes': 'L4,L5,L6,L7',
-        'city_prefixes': 'mississauga,oakville,brampton,milton,burlington',
-    },
-    {
-        'code': 'GTA_NORTH',
-        'name': 'York Region / Vaughan / Markham',
-        'region': 'GTA',
-        'color': '#81b29a',
-        'fsa_prefixes': 'L3,L4',
-        'city_prefixes': 'vaughan,markham,richmond hill,aurora,newmarket',
-    },
-    {
-        'code': 'HAMILTON_NIAGARA',
-        'name': 'Hamilton / Niagara',
-        'region': 'Southwest',
-        'color': '#3d5a80',
-        'fsa_prefixes': 'L8,L9,L0R,L2,L3',
-        'city_prefixes': 'hamilton,niagara,st catharines,st. catharines,welland',
-    },
-    {
-        'code': 'SW_ONT',
-        'name': 'Southwest Ontario (London/Windsor)',
-        'region': 'Southwest',
-        'color': '#6a994e',
-        'fsa_prefixes': 'N',
-        'city_prefixes': 'london,windsor,kitchener,waterloo,cambridge,guelph',
-    },
-    {
-        'code': 'OTTAWA',
-        'name': 'Ottawa + Eastern Ontario',
-        'region': 'East',
-        'color': '#457b9d',
-        'fsa_prefixes': 'K1,K2,K4,K6,K7',
-        'city_prefixes': 'ottawa,kingston,kanata,nepean,gloucester,orleans',
-    },
-    {
-        'code': 'CENTRAL_ONT',
-        'name': 'Central Ontario (Barrie/Muskoka)',
-        'region': 'Central',
-        'color': '#a98467',
-        'fsa_prefixes': 'L0,L4M,L4N,L9,P0',
-        'city_prefixes': 'barrie,orillia,gravenhurst,bracebridge,huntsville,peterborough',
-    },
-    {
-        'code': 'NORTHERN_ONT',
-        'name': 'Northern Ontario',
-        'region': 'North',
-        'color': '#264653',
-        'fsa_prefixes': 'P',
-        'city_prefixes': 'sudbury,thunder bay,sault ste marie,sault ste. marie,north bay,timmins',
-    },
+    # Province-wide coverage. FSA prefixes decide (longest match wins), city
+    # names are the fallback, a store with neither is placed by its nearest
+    # neighbour with coordinates, and whatever is left goes to OTHER so that
+    # "Unassigned" reads zero and the leftovers stay visible.
+    {'code': 'TOR_CORE', 'name': 'Toronto Core', 'region': 'GTA', 'color': '#e63946',
+     'fsa_prefixes': 'M4,M5,M6,M7',
+     'city_prefixes': 'toronto'},
+    {'code': 'TOR_EAST', 'name': 'Toronto East + Scarborough', 'region': 'GTA', 'color': '#f4a261',
+     'fsa_prefixes': 'M1,M2,M3,M4L,M4M',
+     'city_prefixes': 'scarborough,east york,north york'},
+    {'code': 'TOR_WEST', 'name': 'Toronto West + Etobicoke', 'region': 'GTA', 'color': '#e07a5f',
+     'fsa_prefixes': 'M8,M9',
+     'city_prefixes': 'etobicoke,york'},
+    {'code': 'GTA_WEST', 'name': 'Mississauga / Oakville / Brampton', 'region': 'GTA', 'color': '#f2cc8f',
+     'fsa_prefixes': 'L4T,L4V,L4W,L4X,L4Y,L4Z,L5,L6,L7,L9T,L0P',
+     'city_prefixes': 'mississauga,oakville,brampton,milton,burlington,georgetown,caledon,bolton,halton hills'},
+    {'code': 'GTA_NORTH', 'name': 'York Region / Vaughan / Markham', 'region': 'GTA', 'color': '#81b29a',
+     'fsa_prefixes': 'L3P,L3R,L3S,L3T,L3X,L3Y,L3Z,L4A,L4B,L4C,L4E,L4G,L4H,L4J,L4K,L4L,L4P,L4S,L7B,L0E,L0G,L0H,L0J',
+     'city_prefixes': 'vaughan,markham,richmond hill,aurora,newmarket,thornhill,woodbridge,maple,king city,stouffville,unionville,concord,kleinburg,keswick,bradford,uxbridge'},
+    {'code': 'DURHAM', 'name': 'Durham / Northumberland', 'region': 'East', 'color': '#3d405b',
+     'fsa_prefixes': 'L1,L9L,L0B,L0C,K9A',
+     'city_prefixes': 'oshawa,whitby,ajax,pickering,bowmanville,courtice,port perry,brooklin,newcastle,port hope,cobourg,clarington'},
+    {'code': 'HAMILTON_NIAGARA', 'name': 'Hamilton / Niagara', 'region': 'Southwest', 'color': '#457b9d',
+     'fsa_prefixes': 'L8,L9A,L9B,L9C,L9G,L9H,L9K,L0R,L2,L3B,L3C,L3K,L3M',
+     'city_prefixes': 'hamilton,niagara,st catharines,st. catharines,welland,stoney creek,ancaster,dundas,grimsby,fort erie,port colborne,thorold,beamsville,lincoln,pelham,fonthill'},
+    {'code': 'SW_ONT', 'name': 'Southwest Ontario (London/Windsor)', 'region': 'Southwest', 'color': '#6a994e',
+     'fsa_prefixes': 'N',
+     'city_prefixes': 'london,windsor,kitchener,waterloo,cambridge,guelph,brantford,sarnia,chatham,stratford,woodstock,st thomas,owen sound,leamington,goderich,paris,simcoe,tillsonburg,strathroy'},
+    {'code': 'OTTAWA', 'name': 'Ottawa + Ottawa Valley', 'region': 'East', 'color': '#2a9d8f',
+     'fsa_prefixes': 'K1,K2,K4,K0A,K0B,K0G,K0J,K7S,K7V,K8A,K8B,K8H',
+     'city_prefixes': 'ottawa,kanata,nepean,gloucester,orleans,stittsville,barrhaven,rockland,embrun,kemptville,arnprior,renfrew,pembroke,petawawa,carleton place,almonte'},
+    {'code': 'EAST_ONT', 'name': 'Kingston / Quinte / Eastern Ontario', 'region': 'East', 'color': '#8d99ae',
+     'fsa_prefixes': 'K6,K7,K0C,K0E,K0H,K0K,K8N,K8P,K8R,K8V',
+     'city_prefixes': 'kingston,belleville,trenton,quinte west,napanee,brockville,cornwall,picton,prescott,gananoque,smiths falls,perth,deseronto,alexandria,lancaster,morrisburg,brighton,bancroft'},
+    {'code': 'CENTRAL_ONT', 'name': 'Central Ontario (Barrie/Muskoka/Kawarthas)', 'region': 'Central', 'color': '#a98467',
+     'fsa_prefixes': 'L4M,L4N,L4R,L9M,L9N,L9P,L9R,L9S,L9V,L9W,L9X,L9Y,L9Z,L3V,L0K,L0L,L0M,L0N,L0A,K9,K0L,K0M,P1,P0A,P0B,P0C,P0E,P0G',
+     'city_prefixes': 'barrie,orillia,gravenhurst,bracebridge,huntsville,peterborough,lindsay,midland,collingwood,wasaga beach,innisfil,alliston,orangeville,penetang,minden,haliburton,bobcaygeon,lakefield,parry sound,shelburne,bradford west'},
+    {'code': 'NORTHERN_ONT', 'name': 'Northern Ontario', 'region': 'North', 'color': '#5a189a',
+     'fsa_prefixes': 'P',
+     'city_prefixes': 'sudbury,thunder bay,sault ste marie,sault ste. marie,north bay,timmins,kenora,hornepayne,elliot lake,kapuskasing,cochrane,dryden,fort frances'},
+    {'code': 'OTHER', 'name': 'Other / no address on file', 'region': '', 'color': '#6c757d',
+     'fsa_prefixes': '',
+     'city_prefixes': ''},
 ]
 
 
@@ -7243,25 +7206,65 @@ def seed_territories():
                    VALUES ('UNASSIGNED','Unassigned','','#888888')""",
             )
         conn.commit()
-        # Now auto-assign stores that don't yet have a territory_id
+        # Place every store. A store whose placement changes is logged to
+        # territory_status_history (never silently moved); a store with no
+        # postal and no city is placed by its nearest neighbour with
+        # coordinates; whatever is left goes to OTHER, never UNASSIGNED.
         cur.execute("SELECT id, code FROM territories")
         code_to_id = {row[1]: row[0] for row in cur.fetchall()}
-        cur.execute("SELECT id, postal, city FROM stores WHERE territory_id IS NULL OR territory_id = 0")
-        unassigned = cur.fetchall()
-        assigned_count = 0
-        for sid, postal, city in unassigned:
-            tcode = classify_territory(postal, city)
-            tid = code_to_id.get(tcode) or code_to_id.get('UNASSIGNED')
-            if tid:
+        id_to_code = {v: k for k, v in code_to_id.items()}
+        cur.execute("SELECT id, store_number, postal, city, lat, lng, territory_id FROM stores")
+        all_stores = cur.fetchall()
+        placed = {}      # store id -> code
+        anchors = []     # (lat, lng, code) for the nearest-neighbour fallback
+        for sid, sn, postal, city, lat, lng, tid in all_stores:
+            code = classify_territory(postal, city)
+            if code == 'UNASSIGNED':
+                code = None
+            placed[sid] = code
+            if code and lat and lng:
+                anchors.append((float(lat), float(lng), code))
+        import math as _m
+        def _nearest(lat, lng):
+            best, best_d = None, 1e18
+            for alat, alng, acode in anchors:
+                d = (alat - lat) ** 2 + ((alng - lng) * _m.cos(_m.radians(lat))) ** 2
+                if d < best_d:
+                    best, best_d = acode, d
+            return best
+        assigned_count = moved = 0
+        for sid, sn, postal, city, lat, lng, tid in all_stores:
+            code = placed.get(sid)
+            if code is None and lat and lng and anchors:
+                code = _nearest(float(lat), float(lng))
+            if code is None:
+                code = 'OTHER'
+            new_tid = code_to_id.get(code) or code_to_id.get('OTHER')
+            if not new_tid or new_tid == tid:
+                continue
+            old_code = id_to_code.get(tid, '') if tid else ''
+            if USE_POSTGRES:
+                cur.execute("UPDATE stores SET territory_id=%s WHERE id=%s", (new_tid, sid))
+            else:
+                cur.execute("UPDATE stores SET territory_id=? WHERE id=?", (new_tid, sid))
+            assigned_count += 1
+            if old_code and old_code not in ('UNASSIGNED', 'OTHER'):
+                moved += 1
+            try:
                 if USE_POSTGRES:
-                    cur.execute("UPDATE stores SET territory_id=%s WHERE id=%s", (tid, sid))
+                    cur.execute("INSERT INTO territory_status_history (store_number, field, old_value, new_value, changed_by) "
+                                "VALUES (%s,'territory',%s,%s,'auto-assign')", (sn, old_code, code))
                 else:
-                    cur.execute("UPDATE stores SET territory_id=? WHERE id=?", (tid, sid))
-                assigned_count += 1
+                    cur.execute("INSERT INTO territory_status_history (store_number, field, old_value, new_value, changed_by) "
+                                "VALUES (?,'territory',?,?,'auto-assign')", (sn, old_code, code))
+            except Exception:
+                pass
         conn.commit()
         cur.close()
+        if moved:
+            print(f"[CRM] {moved} stores moved between territories by the province-wide rules (logged)")
         print(f"[CRM] Territories seeded: {len(ONTARIO_TERRITORIES)} + UNASSIGNED. "
-              f"Auto-assigned territory to {assigned_count} stores.")
+              f"Placed or re-placed {assigned_count} stores.")
     except Exception as e:
         print(f"[CRM] seed_territories failed: {e}")
     finally:
@@ -7693,6 +7696,7 @@ def _gap_report_payload(db, sku=None, territory_id=None, include='actionable'):
     if territory_id:
         sw.append('s.territory_id = ?'); sp.append(territory_id)
     stores = []
+    no_address = 0
     for r in db_fetchall(
             "SELECT s.store_number, s.account, s.address, s.city, s.postal, s.rep, s.priority, "
             "s.territory_id, COALESCE(t.code,'') AS tcode, COALESCE(t.name,'') AS tname, "
@@ -7700,6 +7704,9 @@ def _gap_report_payload(db, sku=None, territory_id=None, include='actionable'):
             f"WHERE {' AND '.join(sw)} ORDER BY COALESCE(t.name,'zzz'), s.city, s.store_number", sp):
         d = row_to_dict(r)
         if int(d['store_number']) in sod_asof.WAREHOUSE_LOCATIONS:
+            continue
+        if (d.get('tcode') or '') == 'OTHER':
+            no_address += 1          # no postal, city or coordinates on file: nothing to visit
             continue
         stores.append(d)
     # rep touches
@@ -7739,6 +7746,7 @@ def _gap_report_payload(db, sku=None, territory_id=None, include='actionable'):
         except Exception:
             pass
     today = _toronto_today() if '_toronto_today' in globals() else _date.today()
+    dq['stores_without_address'] = no_address
     out = {'generated_for': str(today), 'data_quality': dq, 'territory_id': territory_id,
            'include': include, 'skus': []}
     for tsku in skus:
